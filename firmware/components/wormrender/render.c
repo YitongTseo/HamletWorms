@@ -200,7 +200,6 @@ static float text_width_t(const char *s, int len, float tracking) {
     return w > 0 ? w - tracking : 0;
 }
 
-static float text_width(const char *s, int len) { return text_width_t(s, len, 0.0f); }
 
 // Centred on (cx, cy), matching the site's textAlign/textBaseline centre in
 // viewer/focus/text-canvas.js. Rows outside the band are skipped.
