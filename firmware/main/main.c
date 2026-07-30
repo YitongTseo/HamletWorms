@@ -58,6 +58,7 @@ static volatile uint32_t s_frames_total;
 static volatile int s_stage;      // 0 sim, 1 draw, 2 blit
 static volatile int s_stage_band;
 static volatile uint32_t s_blit_timeouts;
+static bool s_blit_pending;
 
 // Pull two fields out of the asset's META blob without dragging in a JSON
 // parser for a string the bake tool wrote itself.
@@ -95,10 +96,15 @@ static int s_band_rows = 32;
 static void blit_band(void *user, int y, int h, const uint16_t *pixels) {
     s_stage = 2;
     s_stage_band = y / (h ? h : 1);
-    esp_lcd_panel_draw_bitmap(s_panel, 0, y, WR_W, y + h, pixels);
+    // Wait for the PREVIOUS band before starting this one, not for this one
+    // after. The renderer has already moved to the other buffer, so the panel
+    // is free to transmit band N while band N+1 is being drawn.
     // Bounded, not portMAX_DELAY: a lost completion should cost one dropped
     // frame, not the whole animal.
-    if (xSemaphoreTake(s_blit_done, pdMS_TO_TICKS(200)) != pdTRUE) s_blit_timeouts++;
+    if (s_blit_pending && xSemaphoreTake(s_blit_done, pdMS_TO_TICKS(200)) != pdTRUE)
+        s_blit_timeouts++;
+    esp_lcd_panel_draw_bitmap(s_panel, 0, y, WR_W, y + h, pixels);
+    s_blit_pending = true;
     s_stage = 1;
 }
 
@@ -183,6 +189,11 @@ static void worm_task(void *arg) {
         int64_t t_a = esp_timer_get_time();
         s_stage = 1;
         wr_draw_banded(&s_ctx, s_world, blit_band, NULL);
+        // Drain the final band before the next frame reuses its buffer.
+        if (s_blit_pending) {
+            if (xSemaphoreTake(s_blit_done, pdMS_TO_TICKS(200)) != pdTRUE) s_blit_timeouts++;
+            s_blit_pending = false;
+        }
         int64_t t_b = esp_timer_get_time();
         // Draw and blit are interleaved per band now, so they are timed as one.
         us_draw += t_b - t_a;

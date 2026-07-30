@@ -56,7 +56,13 @@ extern const int wr_font_size, wr_font_ascent, wr_font_descent;
 #define WR_GLOBE 0x1E6B4C       // the graticule behind everything
 
 typedef struct {
-    uint16_t *band;  // WR_W x band_rows, RGB565
+    // Two band buffers, alternated. The panel's DMA reads a band after
+    // draw_bitmap has already returned, so with a single buffer the renderer
+    // would be overwriting pixels that are still being transmitted. Alternating
+    // lets band N transmit while band N+1 is drawn.
+    uint16_t *band;      // the one being drawn into
+    uint16_t *band_mem;  // both, back to back
+    int band_parity;
     uint8_t *cov;    // per-pixel body coverage
     uint8_t *seg;    // per-pixel position along the body, for the gradient
     int band_rows;
@@ -93,6 +99,12 @@ typedef struct {
 } wr_ctx;
 
 // Called once per band with rows [y, y + h) of the frame.
+//
+// May return before the pixels have actually been sent. The renderer will not
+// touch that buffer again until it has called blit once more with the other
+// one, so an implementation that transmits asynchronously must wait for the
+// PREVIOUS transfer to finish before starting this one, and the caller must
+// drain the last transfer after wr_draw_banded returns.
 typedef void (*wr_blit_fn)(void *user, int y, int h, const uint16_t *pixels);
 
 // Scratch for one band: pixels + coverage + body position. Put it in internal

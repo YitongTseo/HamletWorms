@@ -27,8 +27,8 @@
 #define WR_DEFAULT_RADIUS 15.0f
 
 size_t wr_scratch_bytes(int band_rows) {
-    // band pixels (RGB565) + coverage byte + body-position byte
-    return (size_t)WR_W * band_rows * (2 + 1 + 1);
+    // two band buffers (RGB565) + coverage byte + body-position byte
+    return (size_t)WR_W * band_rows * (2 + 2 + 1 + 1);
 }
 
 size_t wr_globe_bytes(void) { return (size_t)WR_W * WR_H; }
@@ -75,8 +75,10 @@ static void build_globe_lut(void) {
 void wr_init(wr_ctx *c, uint8_t *scratch, int band_rows, const uint8_t *globe) {
     memset(c, 0, sizeof(*c));
     c->band_rows = band_rows;
-    c->band = (uint16_t *)scratch;
-    c->cov = scratch + (size_t)WR_W * band_rows * 2;
+    c->band_mem = (uint16_t *)scratch;
+    c->band = c->band_mem;
+    c->band_parity = 0;
+    c->cov = scratch + (size_t)WR_W * band_rows * 4;
     c->seg = c->cov + (size_t)WR_W * band_rows;
     c->globe = globe;
 
@@ -509,6 +511,9 @@ void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user) {
     for (int y0 = 0; y0 < WR_H; y0 += c->band_rows) {
         int h = WR_H - y0 < c->band_rows ? WR_H - y0 : c->band_rows;
         size_t n = (size_t)WR_W * h;
+
+        c->band = c->band_mem + (size_t)c->band_parity * WR_W * c->band_rows;
+        c->band_parity ^= 1;
 
         for (size_t i = 0; i < n; i++) c->band[i] = stage;
 
