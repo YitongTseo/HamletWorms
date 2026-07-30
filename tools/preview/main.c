@@ -59,6 +59,9 @@ int main(int argc, char **argv) {
     wr_ctx ctx;
     wr_init(&ctx, malloc(wr_scratch_bytes(band_rows)), band_rows, globe);
     ctx.view_units = view_units;
+    ctx.title = "Liam";
+    ctx.subtitle = "flask_1  gen-0007";
+    ctx.title_alpha = 1.0f;
 
     for (int i = 0; i < n_frames; i++) {
         for (int t = 0; t < per_frame; t++) {
@@ -73,7 +76,10 @@ int main(int argc, char **argv) {
             }
         }
         wr_draw_banded(&ctx, w, collect_band, fb);
-        ctx.flash *= 0.62f;  // per frame here; the firmware decays on dt
+        // Same law as firmware/main/main.c, on this frame's simulated dt.
+        float dt = (float)per_frame / (float)WM_BODY_TICK_HZ;
+        ctx.flash -= ctx.flash * dt * 3.2f;
+        if (ctx.flash < 0.002f) ctx.flash = 0.0f;
 
         char name[512];
         snprintf(name, sizeof(name), "%s/frame_%04d.ppm", outdir, i);

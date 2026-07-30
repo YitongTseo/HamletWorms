@@ -33,6 +33,26 @@ static esp_lcd_panel_handle_t s_panel;
 static wm_asset s_asset;
 static wm_world *s_world;
 static wr_ctx s_ctx;
+static char s_title[32], s_subtitle[64];
+
+// Pull two fields out of the asset's META blob without dragging in a JSON
+// parser for a string the bake tool wrote itself.
+static void meta_field(const char *json, const char *key, char *out, size_t cap) {
+    out[0] = 0;
+    if (!json) return;
+    char pat[40];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return;
+    p = strchr(p + strlen(pat), ':');
+    if (!p) return;
+    while (*p && *p != '"') p++;
+    if (!*p) return;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i + 1 < cap) out[i++] = *p++;
+    out[i] = 0;
+}
 
 // Rows per band. Two independent reasons this is not a whole frame:
 //
@@ -88,6 +108,7 @@ static void worm_task(void *arg) {
     int frames = 0;
     int64_t us_sim = 0, us_draw = 0, us_blit = 0;
     int64_t last_us = next_tick_us;
+    float s_hold = 2.5f;
 
     for (;;) {
         // Sim is authoritative on timing: 60 Hz, exactly as World.tick assumes.
@@ -119,7 +140,13 @@ static void worm_task(void *arg) {
         // ~0.2 s whether the renderer is managing 10 fps or 20.
         float dt = (float)(t_loop0 - last_us) / 1e6f;
         last_us = t_loop0;
-        s_ctx.flash -= s_ctx.flash * dt * 5.0f;
+        s_ctx.flash -= s_ctx.flash * dt * 3.2f;  // ~0.3 s tail
+        // Hold the identity card for a couple of seconds, then let it go.
+        if (s_ctx.title_alpha > 0.0f) {
+            s_hold -= dt;
+            if (s_hold < 0.0f) s_ctx.title_alpha -= dt * 0.7f;
+            if (s_ctx.title_alpha < 0.0f) s_ctx.title_alpha = 0.0f;
+        }
         if (s_ctx.flash < 0.002f) s_ctx.flash = 0.0f;
 
         int64_t t_a = esp_timer_get_time();
@@ -191,6 +218,15 @@ void app_main(void) {
     wm_world_init(s_world, &s_asset, s_asset.seed, storage);
     wr_build_globe(globe);
     wr_init(&s_ctx, scratch, s_band_rows, globe);
+
+    meta_field(s_asset.meta, "worm", s_title, sizeof(s_title));
+    char flask[24], gen[24];
+    meta_field(s_asset.meta, "flask", flask, sizeof(flask));
+    meta_field(s_asset.meta, "gen", gen, sizeof(gen));
+    snprintf(s_subtitle, sizeof(s_subtitle), "%s  %s", flask, gen);
+    s_ctx.title = s_title;
+    s_ctx.subtitle = s_subtitle;
+    s_ctx.title_alpha = 1.0f;
 
     ESP_LOGI(TAG, "settling the body (%d ticks)...", WARMUP_TICKS);
     for (int i = 0; i < WARMUP_TICKS; i++) wm_world_tick(s_world);

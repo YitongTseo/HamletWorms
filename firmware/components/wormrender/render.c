@@ -174,21 +174,24 @@ static int glyph_slot(const char *p, int len, int *consumed) {
     return ch - 32;
 }
 
-static float text_width(const char *s, int len) {
+static float text_width_t(const char *s, int len, float tracking) {
     float w = 0;
     for (int i = 0; i < len;) {
         int used, g = glyph_slot(s + i, len - i, &used);
-        if (g >= 0) w += wr_font_glyph[g].adv;
+        if (g >= 0) w += wr_font_glyph[g].adv + tracking;
         i += used;
     }
-    return w;
+    return w > 0 ? w - tracking : 0;
 }
+
+static float text_width(const char *s, int len) { return text_width_t(s, len, 0.0f); }
 
 // Centred on (cx, cy), matching the site's textAlign/textBaseline centre in
 // viewer/focus/text-canvas.js. Rows outside the band are skipped.
-static void draw_text(wr_ctx *c, int y0, int h, const char *s, int len,
-                      float cx, float cy, uint32_t color, uint32_t alpha) {
-    float pen = cx - text_width(s, len) / 2.0f;
+static void draw_text_t(wr_ctx *c, int y0, int h, const char *s, int len,
+                        float cx, float cy, uint32_t color, uint32_t alpha,
+                        float tracking) {
+    float pen = cx - text_width_t(s, len, tracking) / 2.0f;
     float base = cy + wr_font_size * 0.36f;  // optical centre, not the baseline
 
     for (int i = 0; i < len;) {
@@ -212,8 +215,13 @@ static void draw_text(wr_ctx *c, int y0, int h, const char *s, int len,
                 }
             }
         }
-        pen += g->adv;
+        pen += g->adv + tracking;
     }
+}
+
+static void draw_text(wr_ctx *c, int y0, int h, const char *s, int len,
+                      float cx, float cy, uint32_t color, uint32_t alpha) {
+    draw_text_t(c, y0, h, s, len, cx, cy, color, alpha, 0.0f);
 }
 
 static void band_words(wr_ctx *c, const wm_world *w, int y0, int h) {
@@ -404,11 +412,11 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
             float t = (float)i / (float)(n - 1);
             // Wave sweeping head to tail over the life of the flash.
             float phase = (1.0f - c->flash) * 1.6f - t;
-            float lit = 1.0f - fabsf(phase) * 3.0f;
+            float lit = 1.0f - fabsf(phase) * 2.2f;
             if (lit <= 0.0f) continue;
             uint32_t a = (uint32_t)(lit * c->flash * 230.0f);
             if (a > 255) a = 255;
-            dot(c, y0, h, px[i], py[i], rad[i] * 0.42f + 1.0f, WR_FIRE, a);
+            dot(c, y0, h, px[i], py[i], rad[i] * 0.52f + 1.2f, WR_FIRE, a);
         }
     }
 }
@@ -490,6 +498,26 @@ void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user) {
         band_words(c, w, y0, h);
         band_worm(c, y0, h, px, py, rad);
         if (ring_a > 4) pulse_ring(c, y0, h, ring_r, ring_a);
+
+        if (c->title_alpha > 0.01f && c->title) {
+            // Veil the scene behind the card. Without it the worm and the words
+            // fight the label for the same pixels; with it the piece simply
+            // fades up out of black as the name fades out.
+            uint32_t veil = (uint32_t)(c->title_alpha * 205.0f);
+            for (size_t i = 0; i < n; i++) blend(&c->band[i], 0x000000, veil);
+
+            // Letterspaced, because a name set wide reads as a label rather
+            // than as another word in the field the worm might eat.
+            uint32_t a = (uint32_t)(c->title_alpha * 255.0f);
+            draw_text_t(c, y0, h, c->title, (int)strlen(c->title),
+                        // Low on the panel, clear of the worm: the camera
+                        // rides the head, so screen centre is always occupied.
+                        WR_W * 0.5f, WR_H * 0.5f - 15.0f, WR_HEAD, a, 6.0f);
+            if (c->subtitle)
+                draw_text_t(c, y0, h, c->subtitle, (int)strlen(c->subtitle),
+                            WR_W * 0.5f, WR_H * 0.5f + 20.0f, WR_ACCENT,
+                            a * 170 / 255, 2.0f);
+        }
         if (c->round_mask) band_mask(c, y0, h);
 
         blit(user, y0, h, c->band);

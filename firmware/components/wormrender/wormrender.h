@@ -81,6 +81,12 @@ typedef struct {
     // along the body and the pulse ring off the head.
     float flash;
 
+    // Identity card, shown briefly at startup. With several boards on a wall
+    // there is otherwise no way to tell which worm you are looking at.
+    const char *title;     // the worm's name
+    const char *subtitle;  // flask and generation
+    float title_alpha;     // 0..1, driven by the caller
+
     bool round_mask;  // zero the corners outside the circular panel
 
     uint32_t cov_pixels;  // body pixels drawn last frame (diagnostic)
