@@ -87,6 +87,7 @@ static void worm_task(void *arg) {
     int64_t fps_t0 = next_tick_us;
     int frames = 0;
     int64_t us_sim = 0, us_draw = 0, us_blit = 0;
+    int64_t last_us = next_tick_us;
 
     for (;;) {
         // Sim is authoritative on timing: 60 Hz, exactly as World.tick assumes.
@@ -107,11 +108,19 @@ static void worm_task(void *arg) {
                 const char *s = wm_str(&s_asset.tok_text, got[i].tok, &len);
                 ESP_LOGI(TAG, "ate %.*s", (int)len, s);
                 voice_say(s_asset.tok_vocab[got[i].tok]);
+                s_ctx.flash = 1.0f;  // neurons fire, ring leaves the head
             }
 
             next_tick_us += 1000000 / WM_BODY_TICK_HZ;
             ticks++;
         }
+
+        // Decay on elapsed time, not per frame, so the flash lasts the same
+        // ~0.2 s whether the renderer is managing 10 fps or 20.
+        float dt = (float)(t_loop0 - last_us) / 1e6f;
+        last_us = t_loop0;
+        s_ctx.flash -= s_ctx.flash * dt * 5.0f;
+        if (s_ctx.flash < 0.002f) s_ctx.flash = 0.0f;
 
         int64_t t_a = esp_timer_get_time();
         wr_draw_banded(&s_ctx, s_world, blit_band, NULL);
@@ -123,11 +132,11 @@ static void worm_task(void *arg) {
         if (++frames == 60) {
             int64_t t = esp_timer_get_time();
             ESP_LOGI(TAG,
-                     "%.1f fps | sim %.0f  draw %.0f  blit %.0f ms/frame | tick %lld | psram %u",
+                     "%.1f fps | sim %.0f  draw %.0f ms | tick %lld | body %lu px",
                      60.0 * 1e6 / (double)(t - fps_t0),
-                     us_sim / 60000.0, us_draw / 60000.0, us_blit / 60000.0,
+                     us_sim / 60000.0, us_draw / 60000.0,
                      (long long)s_world->tick_count,
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+                     (unsigned long)s_ctx.cov_pixels);
             fps_t0 = t;
             us_sim = us_draw = us_blit = 0;
             frames = 0;
@@ -170,13 +179,18 @@ void app_main(void) {
     // to the SPI DMA engine. Internal SRAM, DMA-capable.
     uint8_t *scratch = heap_caps_malloc(wr_scratch_bytes(s_band_rows),
                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    if (!s_world || !storage || !scratch) {
+
+    // The graticule is built once and only ever read sequentially, so PSRAM is
+    // the right home for its 217 KB.
+    uint8_t *globe = heap_caps_malloc(wr_globe_bytes(), MALLOC_CAP_SPIRAM);
+    if (!s_world || !storage || !scratch || !globe) {
         ESP_LOGE(TAG, "out of PSRAM");
         return;
     }
 
     wm_world_init(s_world, &s_asset, s_asset.seed, storage);
-    wr_init(&s_ctx, scratch, s_band_rows);
+    wr_build_globe(globe);
+    wr_init(&s_ctx, scratch, s_band_rows, globe);
 
     ESP_LOGI(TAG, "settling the body (%d ticks)...", WARMUP_TICKS);
     for (int i = 0; i < WARMUP_TICKS; i++) wm_world_tick(s_world);
@@ -194,7 +208,7 @@ void app_main(void) {
             .sample_rate = 8000, .channel = 1, .bits_per_sample = 16,
         };
         esp_codec_dev_open(spk, &fs);
-        esp_codec_dev_set_out_vol(spk, 80);
+        esp_codec_dev_set_out_vol(spk, 100);  // plus 2.5x digital gain in voice.c
         if (voice_init(spk)) voice_start();
     } else {
         ESP_LOGW(TAG, "no speaker; the worm will eat in silence");

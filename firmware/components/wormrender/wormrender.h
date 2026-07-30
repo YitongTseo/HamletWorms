@@ -1,7 +1,7 @@
 // wormrender — draws one worm and its word field, band by band.
 //
 // Portable C, no ESP-IDF: tools/preview builds it on the host and writes PNGs,
-// so the look can be settled before the hardware is wired up.
+// so the look can be settled before touching hardware.
 //
 // Framing: the visible circle is the worm's chemosensory horizon.
 // FOOD_SENSE_RADIUS is 200 world units, so a 400-unit window mapped onto the
@@ -13,9 +13,9 @@
 // the tail trails out of frame. That is deliberate — the head is where the
 // eating happens, and a microscope does not show you the whole animal.
 //
-// Output goes out a band at a time through a caller-supplied blit, rather than
-// into a framebuffer. On the board that means the per-pixel work happens in
-// internal SRAM and each band DMAs straight to the panel; a 466x466 PSRAM
+// Output goes out a band at a time through a caller-supplied blit rather than
+// into a framebuffer. On the board that keeps the per-pixel work in internal
+// SRAM and lets each band DMA straight to the panel; a 466x466 PSRAM
 // framebuffer cost 286-475 ms a frame against 28 ms of actual transfer.
 
 #ifndef WORMRENDER_H
@@ -44,19 +44,28 @@ extern const uint8_t wr_font_atlas[];
 extern const int wr_font_atlas_w, wr_font_atlas_h;
 extern const int wr_font_size, wr_font_ascent, wr_font_descent;
 
-// Palette, from viewer/palette.js "poetry", so the object matches the site.
-#define WR_STAGE 0x03140a   // near-black green — the canvas background
-#define WR_ACCENT 0x3ddc84  // the worm
-#define WR_FG 0xc6f6d5
-#define WR_DIM 0x5a8f6a
-#define WR_WARM 0xffcc66
-#define WR_HOT 0xff6b6b
+// Palette. Black ground, white words, green animal — the specimen-under-glass
+// reading, and the highest contrast the panel can give on all three.
+#define WR_STAGE 0x000000   // true black; an AMOLED pixel here is simply off
+#define WR_WORD 0xFFFFFF
+#define WR_WORD_INERT 0x8FA6C4  // set-dressing: names, stage cues
+#define WR_GHOST 0x2E6B4E       // a word already swallowed
+#define WR_ACCENT 0x3DDC84      // the worm
+#define WR_HEAD 0x9CF7C4        // its anterior, catching the light
+#define WR_FIRE 0xEAFFF2        // neurons, mid-flash
+#define WR_GLOBE 0x1E6B4C       // the graticule behind everything
 
 typedef struct {
     uint16_t *band;  // WR_W x band_rows, RGB565
     uint8_t *cov;    // per-pixel body coverage
     uint8_t *seg;    // per-pixel position along the body, for the gradient
     int band_rows;
+
+    // Full-screen alpha for the globe graticule, built once by wr_build_globe.
+    // Screen-fixed rather than world-fixed: the camera rides the worm's head,
+    // so a static graticule reads as the instrument you are looking through
+    // rather than as scenery the worm crawls over.
+    const uint8_t *globe;
 
     // World units across the display. 400 puts the rim on the smell radius.
     float view_units;
@@ -68,7 +77,13 @@ typedef struct {
     // the whole animal; at this magnification that reads as a snake.
     float body_radius;
 
+    // 1.0 the instant a word is eaten, decaying after. Drives the neuron flash
+    // along the body and the pulse ring off the head.
+    float flash;
+
     bool round_mask;  // zero the corners outside the circular panel
+
+    uint32_t cov_pixels;  // body pixels drawn last frame (diagnostic)
 } wr_ctx;
 
 // Called once per band with rows [y, y + h) of the frame.
@@ -77,7 +92,13 @@ typedef void (*wr_blit_fn)(void *user, int y, int h, const uint16_t *pixels);
 // Scratch for one band: pixels + coverage + body position. Put it in internal
 // SRAM — that is the entire point of banding.
 size_t wr_scratch_bytes(int band_rows);
-void wr_init(wr_ctx *c, uint8_t *scratch, int band_rows);
+
+// One alpha byte per pixel. Built once at startup; PSRAM is fine, it is only
+// ever read sequentially.
+size_t wr_globe_bytes(void);
+void wr_build_globe(uint8_t *mask);
+
+void wr_init(wr_ctx *c, uint8_t *scratch, int band_rows, const uint8_t *globe);
 void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user);
 
 #endif  // WORMRENDER_H

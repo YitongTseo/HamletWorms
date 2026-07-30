@@ -12,6 +12,8 @@
 // double operations are software routines. That is the opposite of the call
 // made in wormsim, whose determinism depends on float64 — but nothing in here
 // feeds the simulation.
+//
+// Draw order, back to front: globe graticule, words, worm, flash.
 
 #include "wormrender.h"
 
@@ -21,13 +23,15 @@
 
 // viewer/focus/worm-render.js uses WORM_BASE_RADIUS = 22 world units, but its
 // camera frames the whole 800-unit body. Here the window is 400 units, so 22
-// reads as a snake. 14 keeps the nematode slenderness at this magnification.
-#define WR_DEFAULT_RADIUS 14.0f
+// reads as a snake. 15 keeps the nematode slenderness at this magnification.
+#define WR_DEFAULT_RADIUS 15.0f
 
 size_t wr_scratch_bytes(int band_rows) {
     // band pixels (RGB565) + coverage byte + body-position byte
     return (size_t)WR_W * band_rows * (2 + 1 + 1);
 }
+
+size_t wr_globe_bytes(void) { return (size_t)WR_W * WR_H; }
 
 static inline uint16_t to565(uint32_t c) {
     return (uint16_t)((((c >> 16) & 0xFF) >> 3) << 11 |
@@ -48,12 +52,20 @@ static inline void blend(uint16_t *px, uint32_t c, uint32_t a) {
                      (((sb * a + db * ia) * 257) >> 16));
 }
 
-void wr_init(wr_ctx *c, uint8_t *scratch, int band_rows) {
+static inline uint32_t lerp_rgb(uint32_t a, uint32_t b, uint32_t m) {
+    uint32_t ia = 255 - m;
+    return ((((a >> 16 & 0xFF) * ia + (b >> 16 & 0xFF) * m) / 255) << 16) |
+           ((((a >> 8 & 0xFF) * ia + (b >> 8 & 0xFF) * m) / 255) << 8) |
+           (((a & 0xFF) * ia + (b & 0xFF) * m) / 255);
+}
+
+void wr_init(wr_ctx *c, uint8_t *scratch, int band_rows, const uint8_t *globe) {
     memset(c, 0, sizeof(*c));
     c->band_rows = band_rows;
     c->band = (uint16_t *)scratch;
     c->cov = scratch + (size_t)WR_W * band_rows * 2;
     c->seg = c->cov + (size_t)WR_W * band_rows;
+    c->globe = globe;
 
     // 400 world units across = 2 x FOOD_SENSE_RADIUS, so the rim of the round
     // display sits exactly on the edge of what the worm can smell.
@@ -70,6 +82,82 @@ static inline void w2s(const wr_ctx *c, float wx, float wy, float *sx, float *sy
     float s = scale_of(c);
     *sx = (wx - c->cam_x) * s + WR_W / 2.0f;
     *sy = (wy - c->cam_y) * s + WR_H / 2.0f;
+}
+
+// --- globe graticule ---------------------------------------------------------
+
+static void splat(uint8_t *mask, float x, float y, float a) {
+    int xi = (int)floorf(x), yi = (int)floorf(y);
+    float fx = x - xi, fy = y - yi;
+    for (int dy = 0; dy < 2; dy++) {
+        int py = yi + dy;
+        if (py < 0 || py >= WR_H) continue;
+        float wy = dy ? fy : 1.0f - fy;
+        for (int dx = 0; dx < 2; dx++) {
+            int px = xi + dx;
+            if (px < 0 || px >= WR_W) continue;
+            float wx = dx ? fx : 1.0f - fx;
+            uint32_t v = (uint32_t)(a * wx * wy);
+            if (v > 255) v = 255;
+            uint8_t *m = &mask[(size_t)py * WR_W + px];
+            if (v > *m) *m = (uint8_t)v;  // max, so crossings do not pile up
+        }
+    }
+}
+
+// A wireframe sphere under orthographic projection: parallels and meridians,
+// tilted so neither collapses to a straight line. Alpha falls off with depth so
+// the far side of the sphere sits behind the near side, which is the whole
+// reason it reads as a globe and not a flat grid.
+void wr_build_globe(uint8_t *mask) {
+    memset(mask, 0, wr_globe_bytes());
+
+    const float cx = WR_W * 0.5f, cy = WR_H * 0.5f;
+    const float R = WR_W * 0.5f - 5.0f;
+    const float tilt = 0.41f;  // ~23.5 degrees, because why not that one
+    const float ct = cosf(tilt), st = sinf(tilt);
+
+    const float A_NEAR = 60.0f, A_FAR = 17.0f;
+
+    // Parallels every 30 degrees of latitude.
+    for (int p = -2; p <= 2; p++) {
+        float lat = (float)p * 30.0f * (float)M_PI / 180.0f;
+        float clat = cosf(lat), slat = sinf(lat);
+        for (int i = 0; i < 720; i++) {
+            float lon = (float)i * (2.0f * (float)M_PI / 720.0f);
+            float x = R * clat * cosf(lon);
+            float y = R * slat;
+            float z = R * clat * sinf(lon);
+            float yr = y * ct - z * st;
+            float zr = y * st + z * ct;
+            float depth = zr / R;  // -1 far .. +1 near
+            splat(mask, cx + x, cy + yr, A_FAR + (A_NEAR - A_FAR) * (depth * 0.5f + 0.5f));
+        }
+    }
+
+    // Meridians every 30 degrees of longitude.
+    for (int mrd = 0; mrd < 6; mrd++) {
+        float lon = (float)mrd * 30.0f * (float)M_PI / 180.0f;
+        float clon = cosf(lon), slon = sinf(lon);
+        for (int i = 0; i <= 720; i++) {
+            float lat = -(float)M_PI / 2.0f + (float)i * ((float)M_PI / 720.0f);
+            float clat = cosf(lat);
+            float x = R * clat * clon;
+            float y = R * sinf(lat);
+            float z = R * clat * slon;
+            float yr = y * ct - z * st;
+            float zr = y * st + z * ct;
+            float depth = zr / R;
+            splat(mask, cx + x, cy + yr, A_FAR + (A_NEAR - A_FAR) * (depth * 0.5f + 0.5f));
+        }
+    }
+
+    // The limb, a touch brighter — it is the silhouette and wants to close the
+    // form rather than fade out with the rest.
+    for (int i = 0; i < 2200; i++) {
+        float a = (float)i * (2.0f * (float)M_PI / 2200.0f);
+        splat(mask, cx + R * cosf(a), cy + R * sinf(a), 74.0f);
+    }
 }
 
 // --- text -------------------------------------------------------------------
@@ -131,7 +219,7 @@ static void draw_text(wr_ctx *c, int y0, int h, const char *s, int len,
 static void band_words(wr_ctx *c, const wm_world *w, int y0, int h) {
     const wm_asset *a = w->a;
     const wm_scroller *sc = &w->scroller;
-    const float margin = 40.0f;
+    const float margin = 60.0f;
 
     for (int li = 0; li < sc->n_lines; li++) {
         const wm_line *L = &sc->lines[li];
@@ -146,18 +234,18 @@ static void band_words(wr_ctx *c, const wm_world *w, int y0, int h) {
             uint32_t len;
             const char *txt = wm_str(&a->tok_text, word->tok, &len);
 
-            // Same colour logic as the site: edible words read bright, inedible
-            // set-dressing (speaker names, stage cues) recedes to blue-grey.
+            // Edible words read bright; inedible set-dressing (speaker names,
+            // stage cues) recedes, the way it does on the site.
             uint32_t color, alpha;
             if (word->eaten) {
-                color = WR_DIM;
-                alpha = 60;  // ghost of a word already swallowed
+                color = WR_GHOST;
+                alpha = 90;  // still there, but spent
             } else if (L->edible) {
-                color = 0xFFFFFF;
-                alpha = 178;
+                color = WR_WORD;
+                alpha = 255;
             } else {
-                color = 0x96AACD;
-                alpha = 115;
+                color = WR_WORD_INERT;
+                alpha = 120;
             }
             draw_text(c, y0, h, txt, (int)len, sx, sy, color, alpha);
         }
@@ -229,6 +317,53 @@ static void cover_segment(wr_ctx *c, int y0, int h, float ax, float ay,
     }
 }
 
+// A filled disc, used for the neurons firing along the body.
+static void dot(wr_ctx *c, int y0, int h, float x, float y, float r,
+                uint32_t color, uint32_t alpha) {
+    int miny = (int)floorf(y - r - 1) - y0, maxy = (int)ceilf(y + r + 1) - y0;
+    int minx = (int)floorf(x - r - 1), maxx = (int)ceilf(x + r + 1);
+    if (maxy < 0 || miny >= h || maxx < 0 || minx >= WR_W) return;
+    if (miny < 0) miny = 0;
+    if (maxy >= h) maxy = h - 1;
+    if (minx < 0) minx = 0;
+    if (maxx >= WR_W) maxx = WR_W - 1;
+    for (int py = miny; py <= maxy; py++) {
+        uint16_t *drow = c->band + (size_t)py * WR_W;
+        float dy = (float)(py + y0) + 0.5f - y;
+        for (int px = minx; px <= maxx; px++) {
+            float dx = (float)px + 0.5f - x;
+            float d = sqrtf(dx * dx + dy * dy);
+            float cov = r + 0.5f - d;
+            if (cov <= 0.0f) continue;
+            if (cov > 1.0f) cov = 1.0f;
+            blend(drow + px, color, (uint32_t)(cov * alpha));
+        }
+    }
+}
+
+// The pulse that leaves the head when a word goes in. Drawn from the row-wise
+// closed form, so it costs a handful of pixels per row rather than a pass.
+static void pulse_ring(wr_ctx *c, int y0, int h, float r, uint32_t alpha) {
+    const float cx = WR_W * 0.5f, cy = WR_H * 0.5f;
+    for (int py = 0; py < h; py++) {
+        float dy = (float)(py + y0) + 0.5f - cy;
+        float q = r * r - dy * dy;
+        if (q <= 0.0f) continue;
+        float dx = sqrtf(q);
+        uint16_t *drow = c->band + (size_t)py * WR_W;
+        for (int side = 0; side < 2; side++) {
+            float xc = side ? cx + dx : cx - dx;
+            int x0 = (int)(xc - 2.0f), x1 = (int)(xc + 2.0f);
+            for (int px = x0; px <= x1; px++) {
+                if (px < 0 || px >= WR_W) continue;
+                float d = fabsf((float)px + 0.5f - xc);
+                if (d > 1.5f) continue;
+                blend(drow + px, WR_FIRE, (uint32_t)(alpha * (1.0f - d / 1.5f)));
+            }
+        }
+    }
+}
+
 static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py,
                       const float *rad) {
     memset(c->cov, 0, (size_t)WR_W * h);
@@ -242,8 +377,12 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
     // Composite with a head-to-tail gradient. The anterior is paler and cooler
     // (the pharynx catching light), deepening to the body green behind it,
     // which is what makes the eating end obvious on a screen this small without
-    // gluing a separate highlight onto the nose.
-    const uint32_t head_c = 0x9CF7C4, tail_c = WR_ACCENT;
+    // gluing a separate highlight onto the nose. The flash lifts the whole
+    // animal toward white as a word goes in.
+    uint32_t fm = (uint32_t)(c->flash * 95.0f);
+    uint32_t head_c = lerp_rgb(WR_HEAD, WR_FIRE, fm);
+    uint32_t tail_c = lerp_rgb(WR_ACCENT, WR_FIRE, fm);
+
     for (int y = 0; y < h; y++) {
         uint8_t *crow = c->cov + (size_t)y * WR_W;
         uint8_t *srow = c->seg + (size_t)y * WR_W;
@@ -252,11 +391,24 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
             if (!crow[x]) continue;
             uint32_t m = srow[x] * 255u / 46u;  // ramp over the front ~18%
             if (m > 255u) m = 255u;
-            uint32_t col =
-                ((((head_c >> 16 & 0xFF) * (255 - m) + (tail_c >> 16 & 0xFF) * m) / 255) << 16) |
-                ((((head_c >> 8 & 0xFF) * (255 - m) + (tail_c >> 8 & 0xFF) * m) / 255) << 8) |
-                (((head_c & 0xFF) * (255 - m) + (tail_c & 0xFF) * m) / 255);
-            blend(drow + x, col, crow[x]);
+            blend(drow + x, lerp_rgb(head_c, tail_c, m), crow[x]);
+            c->cov_pixels++;
+        }
+    }
+
+    // Neurons. Every eighth segment carries a node; they light up along the
+    // body while the flash lasts, so eating reads as something travelling
+    // backward through the animal rather than a light being switched on.
+    if (c->flash > 0.02f) {
+        for (int i = 4; i < n - 1; i += 8) {
+            float t = (float)i / (float)(n - 1);
+            // Wave sweeping head to tail over the life of the flash.
+            float phase = (1.0f - c->flash) * 1.6f - t;
+            float lit = 1.0f - fabsf(phase) * 3.0f;
+            if (lit <= 0.0f) continue;
+            uint32_t a = (uint32_t)(lit * c->flash * 230.0f);
+            if (a > 255) a = 255;
+            dot(c, y0, h, px[i], py[i], rad[i] * 0.42f + 1.0f, WR_FIRE, a);
         }
     }
 }
@@ -285,6 +437,7 @@ static void band_mask(wr_ctx *c, int y0, int h) {
 void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user) {
     c->cam_x = (float)w->body.target_x;
     c->cam_y = (float)w->body.target_y;
+    c->cov_pixels = 0;
 
     // Project the midline once for the whole frame. It is 201 points, and
     // reprojecting it per band would repeat that work for every one of them.
@@ -295,21 +448,48 @@ void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user) {
     for (int i = 0; i < WM_N_SEGMENTS; i++)
         w2s(c, (float)b->tx[i], (float)b->ty[i], &px[i + 1], &py[i + 1]);
 
-    // Per-segment radius, computed once for the whole frame.
+    // Per-segment radius, once for the whole frame: body_profile() calls powf
+    // and sinf, and running it per band meant 3000 transcendental calls for 200
+    // distinct answers.
     static float rad[WM_N_SEGMENTS];
     float sc = scale_of(c);
     for (int i = 0; i < WM_N_SEGMENTS; i++)
         rad[i] = c->body_radius * body_profile((float)i / (float)WM_N_SEGMENTS) * sc;
 
     const uint16_t stage = to565(WR_STAGE);
+    float ring_r = (1.0f - c->flash) * 210.0f + 14.0f;
+    uint32_t ring_a = (uint32_t)(c->flash * c->flash * 150.0f);
 
     for (int y0 = 0; y0 < WR_H; y0 += c->band_rows) {
         int h = WR_H - y0 < c->band_rows ? WR_H - y0 : c->band_rows;
-
         size_t n = (size_t)WR_W * h;
+
         for (size_t i = 0; i < n; i++) c->band[i] = stage;
+
+        if (c->globe) {
+            // The graticule is thin lines on a mostly empty mask, so test four
+            // pixels at a time and skip the empty runs whole. Rows are 466 px
+            // and bands start on multiples of 32, so both are multiples of 4.
+            const uint8_t *g = c->globe + (size_t)y0 * WR_W;
+            size_t i = 0;
+            if ((((uintptr_t)g) & 3u) == 0) {
+                const uint32_t *g4 = (const uint32_t *)g;
+                for (; i + 4 <= n; i += 4) {
+                    uint32_t quad = g4[i >> 2];
+                    if (!quad) continue;
+                    for (int k = 0; k < 4; k++) {
+                        uint8_t a = (uint8_t)(quad >> (8 * k));
+                        if (a) blend(&c->band[i + k], WR_GLOBE, a);
+                    }
+                }
+            }
+            for (; i < n; i++)
+                if (g[i]) blend(&c->band[i], WR_GLOBE, g[i]);
+        }
+
         band_words(c, w, y0, h);
         band_worm(c, y0, h, px, py, rad);
+        if (ring_a > 4) pulse_ring(c, y0, h, ring_r, ring_a);
         if (c->round_mask) band_mask(c, y0, h);
 
         blit(user, y0, h, c->band);

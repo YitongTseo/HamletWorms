@@ -35,6 +35,11 @@ static const int8_t INDEX[16] = {-1, -1, -1, -1, 2, 4, 6, 8,
 
 #define PCM_CHUNK 512  // samples handed to the codec at a time
 
+// Digital gain applied before the codec, on top of the codec's own volume.
+// 5/2 = 2.5x. Clipping is saturated, so overshoot dulls rather than cracks.
+#define VOICE_GAIN_NUM 5
+#define VOICE_GAIN_DEN 2
+
 struct voice {
     const uint8_t *bank;      // mmapped `voices` partition
     uint32_t n_words;
@@ -162,6 +167,13 @@ static void speak_blocking(uint16_t vocab_id) {
         int n = decode_block(p + consumed, nbytes, block);
         consumed += nbytes;
 
+        // `say` renders well below full scale and the onboard speaker is tiny,
+        // so lift the whole word before it reaches the codec. Saturating rather
+        // than wrapping — a wrapped sample is a loud click.
+        for (int i = 0; i < n; i++) {
+            int32_t v = (int32_t)block[i] * VOICE_GAIN_NUM / VOICE_GAIN_DEN;
+            block[i] = v > 32767 ? 32767 : (v < -32768 ? -32768 : (int16_t)v);
+        }
         for (int i = 0; i < n; i += PCM_CHUNK) {
             int chunk = n - i < PCM_CHUNK ? n - i : PCM_CHUNK;
             esp_codec_dev_write(V.codec, block + i, chunk * sizeof(int16_t));

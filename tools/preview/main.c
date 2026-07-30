@@ -54,8 +54,10 @@ int main(int argc, char **argv) {
 
     uint16_t *fb = malloc(sizeof(uint16_t) * WR_W * WR_H);
     const int band_rows = 32;
+    uint8_t *globe = malloc(wr_globe_bytes());
+    wr_build_globe(globe);
     wr_ctx ctx;
-    wr_init(&ctx, malloc(wr_scratch_bytes(band_rows)), band_rows);
+    wr_init(&ctx, malloc(wr_scratch_bytes(band_rows)), band_rows, globe);
     ctx.view_units = view_units;
 
     for (int i = 0; i < n_frames; i++) {
@@ -67,9 +69,11 @@ int main(int argc, char **argv) {
                 uint32_t len;
                 const char *s = wm_str(&a.tok_text, got[k].tok, &len);
                 fprintf(stderr, "  frame %d: ate %.*s\n", i, (int)len, s);
+                ctx.flash = 1.0f;
             }
         }
         wr_draw_banded(&ctx, w, collect_band, fb);
+        ctx.flash *= 0.62f;  // per frame here; the firmware decays on dt
 
         char name[512];
         snprintf(name, sizeof(name), "%s/frame_%04d.ppm", outdir, i);
