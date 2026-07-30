@@ -164,8 +164,15 @@ void wm_body_step(wm_body *w);
 // ---------------------------------------------------------------------------
 // Text scroller
 // ---------------------------------------------------------------------------
-#define WM_MAX_ACTIVE_LINES 64
-#define WM_MAX_LINE_WORDS 96
+// Sized for the actual corpus, not for a hypothetical one. Hamlet's longest
+// sentence is 23 tokens, and a line lives 1060 world units / 15 per second =
+// 70.7 s against a 4.5 s spawn interval, so ~16 are ever on screen at once.
+// These were 96 and 64, which put 147 KB of mostly-empty word slots in the
+// scroller; at 40 and 24 the whole wm_world fits in internal SRAM, which is
+// also where the simulation would rather live.
+// tools/bake.py fails the bake if the corpus ever outgrows these.
+#define WM_MAX_ACTIVE_LINES 24
+#define WM_MAX_LINE_WORDS 40
 
 typedef struct {
     uint32_t tok;  // index into asset.tok_* arrays
@@ -204,7 +211,7 @@ typedef struct {
     int32_t word_idx;
 } wm_eaten;
 
-#define WM_EATEN_CAP 64
+#define WM_EATEN_CAP 16
 
 typedef struct {
     const wm_asset *a;

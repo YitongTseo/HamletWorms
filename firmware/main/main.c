@@ -196,10 +196,16 @@ void app_main(void) {
 
     if (!mount_worm()) return;
 
-    // The sim's own state can live in PSRAM: it is walked sequentially and only
-    // 60 times a second.
-    s_world = heap_caps_malloc(sizeof(wm_world), MALLOC_CAP_SPIRAM);
-    void *storage = heap_caps_malloc(wm_world_bytes(&s_asset), MALLOC_CAP_SPIRAM);
+    // The world is ~30 KB now that the scroller is sized for the real corpus,
+    // so it goes in internal SRAM: the IK chain rewrites every segment 60 times
+    // a second and the connectome scatters across psyn on every brain tick.
+    // Fall back to PSRAM rather than refuse to boot.
+    s_world = heap_caps_malloc(sizeof(wm_world), MALLOC_CAP_INTERNAL);
+    if (!s_world) s_world = heap_caps_malloc(sizeof(wm_world), MALLOC_CAP_SPIRAM);
+    void *storage = heap_caps_malloc(wm_world_bytes(&s_asset), MALLOC_CAP_INTERNAL);
+    if (!storage) storage = heap_caps_malloc(wm_world_bytes(&s_asset), MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG, "world %u B + %u B state", (unsigned)sizeof(wm_world),
+             (unsigned)wm_world_bytes(&s_asset));
 
     // The band scratch must NOT. It takes scattered single-byte writes in the
     // coverage pass, which is exactly what PSRAM is worst at, and it is handed

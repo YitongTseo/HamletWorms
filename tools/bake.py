@@ -247,6 +247,13 @@ def main() -> None:
             tok_pos.append(embedding._POS_INDEX.get(pos_scorers.tag_word(t), embedding._POS_INDEX["X"]))
             tok_text.append(t)
         sent_start.append(len(tok_vocab))
+    # The firmware's scroller has fixed-size line slots (WM_MAX_LINE_WORDS /
+    # WM_MAX_ACTIVE_LINES). Silently truncating a line there would drop words
+    # the worm should have been able to eat, so fail here instead.
+    longest = max(len(x) for x in sentences)
+    if longest > 40:
+        sys.exit(f"longest sentence is {longest} tokens; raise WM_MAX_LINE_WORDS")
+
     oov = sum(1 for v in tok_vocab if v == 0xFFFF)
     print(
         f"corpus  {len(sentences)} sentences, {len(tok_vocab)} tokens, "
