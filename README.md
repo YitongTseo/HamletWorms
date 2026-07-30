@@ -55,6 +55,40 @@ The body is 800 world units long against a 400-unit window, so the tail trails
 out of frame. Deliberate: the head is where the eating happens, and a microscope
 does not show you the whole animal.
 
+## Voice
+
+Every word in the vocabulary is pre-rendered by macOS `say` in Daniel (en_GB),
+silence-trimmed, speech-normalised, and packed as IMA-ADPCM at 8 kHz into one
+flash blob indexed by vocabulary id — the same integer the worm asset uses, so
+speaking a word the worm just ate needs no string lookup.
+
+Loudness is fixed in the bank, not with a gain knob at playback. The rendered
+words peak near half full scale but average an RMS of ~2000, a crest factor
+around 8, so multiplying on the way to the codec clips the peaks off most words
+without making them sound louder. `speechnorm` walks the envelope up instead,
+with a limiter behind it.
+
+Codec comparison that chose ADPCM, measured over a 59-word sample and
+extrapolated to the full vocabulary:
+
+| codec | per word | full vocabulary |
+|---|---|---|
+| Opus 16 kbps @16 kHz | 990 B | 4.65 MB |
+| Opus 24 kbps @16 kHz | 1372 B | 6.44 MB |
+| MP3 32 kbps | 2228 B | 10.45 MB |
+| **IMA-ADPCM @8 kHz** | **2263 B** | **10.62 MB** |
+
+ADPCM wins on integration risk rather than size — the decoder is about thirty
+lines and costs nothing — and it already fits. `--codec opus` is wired up for
+when halving it looks worth a decoder dependency.
+
+The decoder has one trap in it. The classic IMA reference accumulates
+`step>>3 + step>>2 + step>>1 + step`, truncating each term; ffmpeg computes
+`((2*delta+1)*step)>>3` and truncates once. Same 1.875×step, one rounding
+apart — and since ffmpeg encoded the bank, rounding the other way drifts from
+the *second sample* and comes out as static. `tools/voxcheck.py` checks the
+firmware's decoder against ffmpeg sample for sample.
+
 ## Layout
 
     tools/bake.py        v7 worm -> .hwrm asset

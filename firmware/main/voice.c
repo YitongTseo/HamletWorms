@@ -61,7 +61,12 @@ struct voice {
     // LoadProhibited inside esp_codec_dev_write.
     int16_t *block;
     uint32_t block_samples;
+    TaskHandle_t task;
 };
+
+// Words left unsaid, for the log — the queue drops rather than lag when the
+// worm eats faster than it can speak.
+static uint32_t v_dropped;
 
 static struct voice V;
 
@@ -191,11 +196,21 @@ static void voice_task(void *arg) {
 }
 
 void voice_start(void) {
-    xTaskCreatePinnedToCore(voice_task, "voice", 4096, NULL, 4, NULL, 0);
+    // 6 KB, not 4. The decode buffer moved to the heap, but this task also
+    // descends into esp_codec_dev and the I2S driver, and 4096 was already
+    // proven too tight once — the first version overflowed it and took the
+    // board down the moment the worm ate its first word.
+    xTaskCreatePinnedToCore(voice_task, "voice", 6144, NULL, 4, &V.task, 0);
 }
 
 void voice_say(uint16_t vocab_id) {
     if (vocab_id == 0xFFFF) return;  // OOV: punctuation and the like, silent
     // Non-blocking on purpose. The sim must not stall waiting on the speaker.
-    xQueueSend(V.q, &vocab_id, 0);
+    if (xQueueSend(V.q, &vocab_id, 0) != pdTRUE) v_dropped++;
 }
+
+uint32_t voice_stack_free(void) {
+    return V.task ? (uint32_t)uxTaskGetStackHighWaterMark(V.task) : 0;
+}
+
+uint32_t voice_dropped(void) { return v_dropped; }

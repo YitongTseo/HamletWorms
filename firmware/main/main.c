@@ -159,11 +159,14 @@ static void worm_task(void *arg) {
         if (++frames == 60) {
             int64_t t = esp_timer_get_time();
             ESP_LOGI(TAG,
-                     "%.1f fps | sim %.0f  draw %.0f ms | tick %lld | body %lu px",
+                     "%.1f fps | sim %.0f  draw %.0f ms | tick %lld | "
+                     "stack worm %u voice %lu | dropped %lu",
                      60.0 * 1e6 / (double)(t - fps_t0),
                      us_sim / 60000.0, us_draw / 60000.0,
                      (long long)s_world->tick_count,
-                     (unsigned long)s_ctx.cov_pixels);
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                     (unsigned long)voice_stack_free(),
+                     (unsigned long)voice_dropped());
             fps_t0 = t;
             us_sim = us_draw = us_blit = 0;
             frames = 0;

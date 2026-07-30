@@ -17,4 +17,9 @@ void voice_start(void);
 // 0xFFFF (OOV) is silent. Never blocks; drops when the queue is full.
 void voice_say(uint16_t vocab_id);
 
+// Smallest free stack the voice task has ever had, in bytes. Watch it rather
+// than guess: this task overflowed once already.
+uint32_t voice_stack_free(void);
+uint32_t voice_dropped(void);
+
 #endif
