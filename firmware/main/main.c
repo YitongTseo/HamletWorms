@@ -33,17 +33,24 @@ static esp_lcd_panel_handle_t s_panel;
 static wm_asset s_asset;
 static wm_world *s_world;
 static wr_ctx s_ctx;
-static uint16_t *s_fb;
 
-// Rows per esp_lcd_panel_draw_bitmap call. A whole 466x466 frame is 434 KB,
-// which is far over the SPI bus's max transaction length, so esp_lcd splits it
-// internally and sets SPI_TRANS_CS_KEEP_ACTIVE on every chunk but the last.
-// That flag is only legal once the bus has been acquired with
-// spi_device_acquire_bus(), and esp_lcd does not do that — so every frame came
-// back "spi transmit (queue) color failed". Handing it bands that already fit
-// means the flag is never set. Computed at startup from the bus itself rather
-// than guessed.
-static int s_band_rows = 16;
+// Rows per band. Two independent reasons this is not a whole frame:
+//
+//  - A 466x466 frame is 434 KB, far over the SPI bus's 32 KB max transaction,
+//    so esp_lcd splits it and sets SPI_TRANS_CS_KEEP_ACTIVE on every chunk but
+//    the last. That flag is only legal once the bus has been acquired with
+//    spi_device_acquire_bus(), which esp_lcd never does, so every frame came
+//    back "spi transmit (queue) color failed".
+//  - The rasteriser's scratch fits in internal SRAM at this size. Drawing into
+//    a PSRAM framebuffer cost 286-475 ms a frame against 28 ms of transfer.
+//
+// Queried from the bus at startup rather than guessed, then rounded down to an
+// even count because the panel wants even row boundaries.
+static int s_band_rows = 32;
+
+static void blit_band(void *user, int y, int h, const uint16_t *pixels) {
+    esp_lcd_panel_draw_bitmap(s_panel, 0, y, WR_W, y + h, pixels);
+}
 
 // The IK chain starts as random jitter (IKChain with facing=None draws 800
 // uniforms) and needs a moment to relax into an animal. Skipping it on the host
@@ -79,13 +86,18 @@ static void worm_task(void *arg) {
     int64_t next_tick_us = esp_timer_get_time();
     int64_t fps_t0 = next_tick_us;
     int frames = 0;
+    int64_t us_sim = 0, us_draw = 0, us_blit = 0;
 
     for (;;) {
         // Sim is authoritative on timing: 60 Hz, exactly as World.tick assumes.
         // The renderer takes whatever is left.
-        int64_t now = esp_timer_get_time();
+        int64_t t_loop0 = esp_timer_get_time();
+        int64_t now = t_loop0;
         int ticks = 0;
-        while (now >= next_tick_us && ticks < 8) {  // cap so a slow frame cannot spiral
+        // Cap at a second of catch-up so a hitch cannot spiral, but high enough
+        // that the sim holds a true 60 Hz: at 8 the worm ran in slow motion,
+        // ~15 ticks/s, because the render frame rate was gating it.
+        while (now >= next_tick_us && ticks < 64) {
             wm_world_tick(s_world);
 
             wm_eaten got[WM_EATEN_CAP];
@@ -101,21 +113,23 @@ static void worm_task(void *arg) {
             ticks++;
         }
 
-        wr_draw(&s_ctx, s_world);
-        for (int y = 0; y < WR_H; y += s_band_rows) {
-            int h = WR_H - y < s_band_rows ? WR_H - y : s_band_rows;
-            esp_lcd_panel_draw_bitmap(s_panel, 0, y, WR_W, y + h,
-                                      s_fb + (size_t)y * WR_W);
-        }
+        int64_t t_a = esp_timer_get_time();
+        wr_draw_banded(&s_ctx, s_world, blit_band, NULL);
+        int64_t t_b = esp_timer_get_time();
+        // Draw and blit are interleaved per band now, so they are timed as one.
+        us_draw += t_b - t_a;
+        us_sim += t_a - t_loop0;
 
         if (++frames == 60) {
             int64_t t = esp_timer_get_time();
-            ESP_LOGI(TAG, "%.1f fps, tick %lld, heap %u, psram %u",
+            ESP_LOGI(TAG,
+                     "%.1f fps | sim %.0f  draw %.0f  blit %.0f ms/frame | tick %lld | psram %u",
                      60.0 * 1e6 / (double)(t - fps_t0),
+                     us_sim / 60000.0, us_draw / 60000.0, us_blit / 60000.0,
                      (long long)s_world->tick_count,
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
             fps_t0 = t;
+            us_sim = us_draw = us_blit = 0;
             frames = 0;
         }
         vTaskDelay(1);  // let the idle task run so the watchdog stays happy
@@ -137,31 +151,32 @@ void app_main(void) {
     if (spi_bus_get_max_transaction_len(BSP_LCD_SPI_NUM, &max_trans) == ESP_OK && max_trans) {
         int rows = (int)(max_trans / (WR_W * sizeof(uint16_t)));
         if (rows < 1) rows = 1;
-        if (rows > WR_H) rows = WR_H;
+        if (rows > 32) rows = 32;   // keeps the scratch inside internal SRAM
+        if (rows > 1) rows &= ~1;   // even: the panel wants even row boundaries
         s_band_rows = rows;
     }
-    ESP_LOGI(TAG, "spi max transaction %u B -> %d rows per blit (%d bands)",
+    ESP_LOGI(TAG, "spi max transaction %u B -> %d rows per band (%d bands)",
              (unsigned)max_trans, s_band_rows, (WR_H + s_band_rows - 1) / s_band_rows);
 
     if (!mount_worm()) return;
 
-    // Framebuffer and the renderer's scratch go in PSRAM; 466*466*2 = 434 KB
-    // would not fit in internal SRAM anyway.
-    // MALLOC_CAP_DMA as well as SPIRAM: esp_lcd hands this straight to
-    // spi_device_queue_trans, which rejects a pointer the DMA engine cannot
-    // reach. Without it every frame fails with "spi transmit (queue) color".
-    s_fb = heap_caps_malloc(WR_W * WR_H * sizeof(uint16_t),
-                            MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    // The sim's own state can live in PSRAM: it is walked sequentially and only
+    // 60 times a second.
     s_world = heap_caps_malloc(sizeof(wm_world), MALLOC_CAP_SPIRAM);
     void *storage = heap_caps_malloc(wm_world_bytes(&s_asset), MALLOC_CAP_SPIRAM);
-    uint8_t *scratch = heap_caps_malloc(wr_scratch_bytes(), MALLOC_CAP_SPIRAM);
-    if (!s_fb || !s_world || !storage || !scratch) {
+
+    // The band scratch must NOT. It takes scattered single-byte writes in the
+    // coverage pass, which is exactly what PSRAM is worst at, and it is handed
+    // to the SPI DMA engine. Internal SRAM, DMA-capable.
+    uint8_t *scratch = heap_caps_malloc(wr_scratch_bytes(s_band_rows),
+                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!s_world || !storage || !scratch) {
         ESP_LOGE(TAG, "out of PSRAM");
         return;
     }
 
     wm_world_init(s_world, &s_asset, s_asset.seed, storage);
-    wr_init(&s_ctx, s_fb, scratch);
+    wr_init(&s_ctx, scratch, s_band_rows);
 
     ESP_LOGI(TAG, "settling the body (%d ticks)...", WARMUP_TICKS);
     for (int i = 0; i < WARMUP_TICKS; i++) wm_world_tick(s_world);

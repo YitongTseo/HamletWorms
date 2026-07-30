@@ -9,6 +9,7 @@
 
 #include "voice.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -44,7 +45,14 @@ struct voice {
 
     esp_codec_dev_handle_t codec;
     QueueHandle_t q;
-    int16_t pcm[PCM_CHUNK];
+
+    // Decoded PCM for one ADPCM block. Heap, NOT stack: at block_align 1024 a
+    // block expands to 2041 samples = 4082 bytes, and this used to be a local
+    // in speak_blocking against a 4096-byte task stack. It overflowed the first
+    // time the worm ate a word and took the whole board down with a
+    // LoadProhibited inside esp_codec_dev_write.
+    int16_t *block;
+    uint32_t block_samples;
 };
 
 static struct voice V;
@@ -88,6 +96,14 @@ bool voice_init(esp_codec_dev_handle_t codec) {
     ESP_LOGI(TAG, "%lu words, %lu Hz, block=%u, spb=%u",
              (unsigned long)V.n_words, (unsigned long)V.sample_rate,
              V.block_align, V.samples_per_block);
+
+    // 1 + (block_align - 4) * 2 samples per block; a couple spare for safety.
+    V.block_samples = 1 + (uint32_t)(V.block_align - 4) * 2;
+    V.block = malloc(sizeof(int16_t) * (V.block_samples + 8));
+    if (!V.block) {
+        ESP_LOGE(TAG, "no room for the decode buffer");
+        return false;
+    }
 
     // Depth 6: the worm can eat a burst of words faster than they can be said
     // (a word averages 0.46 s). Beyond that, drop rather than fall behind — a
@@ -138,7 +154,7 @@ static void speak_blocking(uint16_t vocab_id) {
     if (!len) return;
 
     const uint8_t *p = V.bank + off;
-    int16_t block[2048 + 8];
+    int16_t *block = V.block;
 
     for (uint32_t consumed = 0; consumed < len;) {
         int nbytes = (int)(len - consumed);

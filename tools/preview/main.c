@@ -12,6 +12,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+// The board hands each band straight to the panel; here we reassemble a whole
+// frame so it can be written out as an image.
+static void collect_band(void *user, int y, int h, const uint16_t *pixels) {
+    memcpy((uint16_t *)user + (size_t)y * WR_W, pixels,
+           sizeof(uint16_t) * (size_t)WR_W * h);
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr,
@@ -46,8 +53,9 @@ int main(int argc, char **argv) {
     for (long t = 0; t < warmup; t++) wm_world_tick(w);
 
     uint16_t *fb = malloc(sizeof(uint16_t) * WR_W * WR_H);
+    const int band_rows = 32;
     wr_ctx ctx;
-    wr_init(&ctx, fb, malloc(wr_scratch_bytes()));
+    wr_init(&ctx, malloc(wr_scratch_bytes(band_rows)), band_rows);
     ctx.view_units = view_units;
 
     for (int i = 0; i < n_frames; i++) {
@@ -61,7 +69,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  frame %d: ate %.*s\n", i, (int)len, s);
             }
         }
-        wr_draw(&ctx, w);
+        wr_draw_banded(&ctx, w, collect_band, fb);
 
         char name[512];
         snprintf(name, sizeof(name), "%s/frame_%04d.ppm", outdir, i);
