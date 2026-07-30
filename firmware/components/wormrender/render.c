@@ -391,10 +391,20 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
     memset(c->cov, 0, (size_t)WR_W * h);
     memset(c->seg, 0, (size_t)WR_W * h);
 
+    // Stride the capsules. Segments sit 4 world units apart — about 4.7 px
+    // here — against a body radius near 17 px, so consecutive capsules overlap
+    // almost entirely and rasterising every one is mostly redundant work. One
+    // capsule per pair covers the same area wherever the midline is locally
+    // straighter than the radius, which it is everywhere except the tightest
+    // head curl.
     const int n = WM_N_SEGMENTS + 1;
-    for (int i = 0; i < n - 1; i++)
-        cover_segment(c, y0, h, px[i], py[i], px[i + 1], py[i + 1], rad[i],
+    const int stride = 2;
+    for (int i = 0; i < n - 1; i += stride) {
+        int j = i + stride < n ? i + stride : n - 1;
+        float r = rad[i] > rad[j - 1] ? rad[i] : rad[j - 1];
+        cover_segment(c, y0, h, px[i], py[i], px[j], py[j], r,
                       (uint8_t)((float)i / (float)(n - 1) * 255.0f));
+    }
 
     // Composite with a head-to-tail gradient. The anterior is paler and cooler
     // (the pharynx catching light), deepening to the body green behind it,

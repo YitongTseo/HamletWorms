@@ -175,12 +175,13 @@ static void speak_blocking(uint16_t vocab_id) {
         int n = decode_block(p + consumed, nbytes, block);
         consumed += nbytes;
 
-        // Saturating, never wrapping. At 1:1 this is a no-op the compiler
-        // folds away; it exists so raising VOICE_GAIN_NUM stays safe.
-        for (int i = 0; VOICE_GAIN_NUM != VOICE_GAIN_DEN && i < n; i++) {
+#if VOICE_GAIN_NUM != VOICE_GAIN_DEN
+        // Saturating, never wrapping: a wrapped sample is a loud click.
+        for (int i = 0; i < n; i++) {
             int32_t v = (int32_t)block[i] * VOICE_GAIN_NUM / VOICE_GAIN_DEN;
             block[i] = v > 32767 ? 32767 : (v < -32768 ? -32768 : (int16_t)v);
         }
+#endif
         for (int i = 0; i < n; i += PCM_CHUNK) {
             int chunk = n - i < PCM_CHUNK ? n - i : PCM_CHUNK;
             esp_codec_dev_write(V.codec, block + i, chunk * sizeof(int16_t));
