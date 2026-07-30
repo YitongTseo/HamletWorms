@@ -1,0 +1,10 @@
+# Name,     Type, SubType, Offset,   Size,    Flags
+# 16 MB flash, no SD card: the voice bank and the worm both live here.
+#   worm asset  1.02 MB  ->  1.5 M partition
+#   voice bank 10.47 MB  ->   11 M partition
+# 0x10000 + 3M + 1.5M + 11M = 0xF90000, inside 16 MB with ~450 KB spare.
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  3M,
+worm,       data, 0x40,    ,         1536K,
+voices,     data, 0x41,    ,         11M,

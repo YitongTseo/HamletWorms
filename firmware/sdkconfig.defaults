@@ -1,0 +1,31 @@
+# Flash: 16 MB, quad per the eFuse reading on this board.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# 8 MB octal PSRAM. The framebuffer, the coverage buffers and the mmapped
+# assets all live here; internal SRAM stays free for the stacks.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_FREERTOS_HZ=1000
+
+# The sim runs in float64, which the S3 emulates in software. That is fine at
+# this workload but the compiler must not reassociate or fuse: -ffp-contract=off
+# keeps a*b+c from becoming an FMA, which rounds once instead of twice and would
+# add a second source of drift on top of the one wm_math.h already documents.
+CONFIG_COMPILER_DISABLE_GCC12_WARNINGS=y
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

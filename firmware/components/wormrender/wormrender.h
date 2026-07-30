@@ -51,21 +51,25 @@ typedef struct {
     uint16_t *fb;  // WR_W * WR_H, RGB565 big-endian for the CO5300
 
     // World units across the display. 400 puts the rim on the smell radius.
-    double view_units;
+    float view_units;
 
     // Camera centre, world units. Normally the worm's head.
-    double cam_x, cam_y;
+    float cam_x, cam_y;
 
     // Body half-width in world units. The site uses 22 for a camera that sees
     // the whole animal; at this magnification that reads as a snake rather than
     // a nematode, so the object runs slimmer.
-    double body_radius;
+    float body_radius;
 
     bool show_smell_ring;  // only visible if view_units > 2*FOOD_SENSE_RADIUS
     bool round_mask;       // black the corners outside the circular panel
 } wr_ctx;
 
-void wr_init(wr_ctx *c, uint16_t *framebuffer);
+// Scratch the rasteriser needs: one coverage byte and one body-position byte
+// per pixel. 434 KB, so the caller supplies it — as static .bss it overflows the
+// S3's internal DRAM, and it belongs in PSRAM alongside the framebuffer.
+size_t wr_scratch_bytes(void);
+void wr_init(wr_ctx *c, uint16_t *framebuffer, uint8_t *scratch);
 void wr_draw(wr_ctx *c, const wm_world *w);
 
 // Exposed for the preview harness.

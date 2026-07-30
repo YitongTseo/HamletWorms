@@ -47,7 +47,7 @@ int main(int argc, char **argv) {
 
     uint16_t *fb = malloc(sizeof(uint16_t) * WR_W * WR_H);
     wr_ctx ctx;
-    wr_init(&ctx, fb);
+    wr_init(&ctx, fb, malloc(wr_scratch_bytes()));
     ctx.view_units = view_units;
 
     for (int i = 0; i < n_frames; i++) {
