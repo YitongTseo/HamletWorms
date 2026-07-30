@@ -52,11 +52,24 @@ static inline void blend(uint16_t *px, uint32_t c, uint32_t a) {
                      (((sb * a + db * ia) * 257) >> 16));
 }
 
+// Precomputed composites, both rebuilt only when their inputs change.
+static uint16_t globe_lut[256];   // WR_GLOBE over WR_STAGE, by alpha
+static uint16_t body_lut[256];    // head->tail gradient, by position along body
+static uint32_t body_lut_key = 0xFFFFFFFFu;
+
 static inline uint32_t lerp_rgb(uint32_t a, uint32_t b, uint32_t m) {
     uint32_t ia = 255 - m;
     return ((((a >> 16 & 0xFF) * ia + (b >> 16 & 0xFF) * m) / 255) << 16) |
            ((((a >> 8 & 0xFF) * ia + (b >> 8 & 0xFF) * m) / 255) << 8) |
            (((a & 0xFF) * ia + (b & 0xFF) * m) / 255);
+}
+
+static void build_globe_lut(void) {
+    for (int a = 0; a < 256; a++) {
+        uint16_t px = to565(WR_STAGE);
+        blend(&px, WR_GLOBE, (uint32_t)a);
+        globe_lut[a] = px;
+    }
 }
 
 void wr_init(wr_ctx *c, uint8_t *scratch, int band_rows, const uint8_t *globe) {
@@ -72,6 +85,7 @@ void wr_init(wr_ctx *c, uint8_t *scratch, int band_rows, const uint8_t *globe) {
     c->view_units = 400.0f;
     c->body_radius = WR_DEFAULT_RADIUS;
     c->round_mask = true;
+    build_globe_lut();
 }
 
 static inline float scale_of(const wr_ctx *c) { return (float)WR_W / c->view_units; }
@@ -211,7 +225,7 @@ static void draw_text_t(wr_ctx *c, int y0, int h, const char *s, int len,
                 for (int gx = 0; gx < g->w; gx++) {
                     int px = gx0 + gx;
                     if (px < 0 || px >= WR_W) continue;
-                    blend(dst + px, color, (uint32_t)row[gx] * alpha / 255);
+                    blend(dst + px, color, ((uint32_t)row[gx] * alpha * 257) >> 16);
                 }
             }
         }
@@ -388,8 +402,13 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
     // gluing a separate highlight onto the nose. The flash lifts the whole
     // animal toward white as a word goes in.
     uint32_t fm = (uint32_t)(c->flash * 95.0f);
-    uint32_t head_c = lerp_rgb(WR_HEAD, WR_FIRE, fm);
-    uint32_t tail_c = lerp_rgb(WR_ACCENT, WR_FIRE, fm);
+    if (fm != body_lut_key) {
+        uint32_t head_c = lerp_rgb(WR_HEAD, WR_FIRE, fm);
+        uint32_t tail_c = lerp_rgb(WR_ACCENT, WR_FIRE, fm);
+        for (int m = 0; m < 256; m++)
+            body_lut[m] = to565(lerp_rgb(head_c, tail_c, (uint32_t)m));
+        body_lut_key = fm;
+    }
 
     for (int y = 0; y < h; y++) {
         uint8_t *crow = c->cov + (size_t)y * WR_W;
@@ -399,7 +418,16 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
             if (!crow[x]) continue;
             uint32_t m = srow[x] * 255u / 46u;  // ramp over the front ~18%
             if (m > 255u) m = 255u;
-            blend(drow + x, lerp_rgb(head_c, tail_c, m), crow[x]);
+            uint32_t a = crow[x];
+            if (a >= 255) {
+                drow[x] = body_lut[m];  // the interior, which is most of it
+            } else {
+                uint32_t src = body_lut[m], d = drow[x], ia = 255 - a;
+                drow[x] = (uint16_t)(
+                    (((((src >> 11) & 0x1F) * a + ((d >> 11) & 0x1F) * ia) * 257 >> 16) << 11) |
+                    (((((src >> 5) & 0x3F) * a + ((d >> 5) & 0x3F) * ia) * 257 >> 16) << 5) |
+                    ((((src & 0x1F) * a + (d & 0x1F) * ia) * 257 >> 16)));
+            }
             c->cov_pixels++;
         }
     }
@@ -487,12 +515,12 @@ void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user) {
                     if (!quad) continue;
                     for (int k = 0; k < 4; k++) {
                         uint8_t a = (uint8_t)(quad >> (8 * k));
-                        if (a) blend(&c->band[i + k], WR_GLOBE, a);
+                        if (a) c->band[i + k] = globe_lut[a];
                     }
                 }
             }
             for (; i < n; i++)
-                if (g[i]) blend(&c->band[i], WR_GLOBE, g[i]);
+                if (g[i]) c->band[i] = globe_lut[g[i]];
         }
 
         band_words(c, w, y0, h);

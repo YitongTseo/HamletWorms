@@ -62,6 +62,7 @@ int main(int argc, char **argv) {
     ctx.title = "Liam";
     ctx.subtitle = "flask_1  gen-0007";
     ctx.title_alpha = 1.0f;
+    float hold = 2.5f;
 
     for (int i = 0; i < n_frames; i++) {
         for (int t = 0; t < per_frame; t++) {
@@ -80,6 +81,10 @@ int main(int argc, char **argv) {
         float dt = (float)per_frame / (float)WM_BODY_TICK_HZ;
         ctx.flash -= ctx.flash * dt * 3.2f;
         if (ctx.flash < 0.002f) ctx.flash = 0.0f;
+        // Same hold-then-fade as firmware/main/main.c.
+        hold -= dt;
+        if (hold < 0.0f) ctx.title_alpha -= dt * 0.7f;
+        if (ctx.title_alpha < 0.0f) ctx.title_alpha = 0.0f;
 
         char name[512];
         snprintf(name, sizeof(name), "%s/frame_%04d.ppm", outdir, i);
