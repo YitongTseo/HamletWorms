@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 #include "driver/spi_master.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "voice.h"
@@ -30,10 +31,33 @@
 static const char *TAG = "worm";
 
 static esp_lcd_panel_handle_t s_panel;
+static esp_lcd_panel_io_handle_t s_io;
+
+// esp_lcd_panel_draw_bitmap only QUEUES the transfer; the DMA reads the buffer
+// afterwards. The renderer was handing it a band and immediately overwriting
+// that same buffer with the next one, and after ~100 frames it wedged inside
+// draw_bitmap waiting on a transaction result that never came.
+//
+// So: one band in flight at a time, and the buffer is not touched again until
+// the panel says it is done with it.
+static SemaphoreHandle_t s_blit_done;
+
+static bool IRAM_ATTR on_color_done(esp_lcd_panel_io_handle_t io,
+                                    esp_lcd_panel_io_event_data_t *ev, void *ctx) {
+    BaseType_t hp = pdFALSE;
+    xSemaphoreGiveFromISR(s_blit_done, &hp);
+    return hp == pdTRUE;
+}
 static wm_asset s_asset;
 static wm_world *s_world;
 static wr_ctx s_ctx;
 static char s_title[32], s_subtitle[64];
+static volatile uint32_t s_frames_total;
+// Where the worm task last was. The heartbeat prints it, so a hang says which
+// phase it hung in instead of just going quiet.
+static volatile int s_stage;      // 0 sim, 1 draw, 2 blit
+static volatile int s_stage_band;
+static volatile uint32_t s_blit_timeouts;
 
 // Pull two fields out of the asset's META blob without dragging in a JSON
 // parser for a string the bake tool wrote itself.
@@ -69,7 +93,13 @@ static void meta_field(const char *json, const char *key, char *out, size_t cap)
 static int s_band_rows = 32;
 
 static void blit_band(void *user, int y, int h, const uint16_t *pixels) {
+    s_stage = 2;
+    s_stage_band = y / (h ? h : 1);
     esp_lcd_panel_draw_bitmap(s_panel, 0, y, WR_W, y + h, pixels);
+    // Bounded, not portMAX_DELAY: a lost completion should cost one dropped
+    // frame, not the whole animal.
+    if (xSemaphoreTake(s_blit_done, pdMS_TO_TICKS(200)) != pdTRUE) s_blit_timeouts++;
+    s_stage = 1;
 }
 
 // The IK chain starts as random jitter (IKChain with facing=None draws 800
@@ -113,6 +143,7 @@ static void worm_task(void *arg) {
     for (;;) {
         // Sim is authoritative on timing: 60 Hz, exactly as World.tick assumes.
         // The renderer takes whatever is left.
+        s_stage = 0;
         int64_t t_loop0 = esp_timer_get_time();
         int64_t now = t_loop0;
         int ticks = 0;
@@ -150,28 +181,43 @@ static void worm_task(void *arg) {
         if (s_ctx.flash < 0.002f) s_ctx.flash = 0.0f;
 
         int64_t t_a = esp_timer_get_time();
+        s_stage = 1;
         wr_draw_banded(&s_ctx, s_world, blit_band, NULL);
         int64_t t_b = esp_timer_get_time();
         // Draw and blit are interleaved per band now, so they are timed as one.
         us_draw += t_b - t_a;
         us_sim += t_a - t_loop0;
 
+        s_frames_total++;
         if (++frames == 60) {
             int64_t t = esp_timer_get_time();
             ESP_LOGI(TAG,
                      "%.1f fps | sim %.0f  draw %.0f ms | tick %lld | "
-                     "stack worm %u voice %lu | dropped %lu",
+                     "stack worm %u voice %lu | dropped %lu | blit-to %lu",
                      60.0 * 1e6 / (double)(t - fps_t0),
                      us_sim / 60000.0, us_draw / 60000.0,
                      (long long)s_world->tick_count,
                      (unsigned)uxTaskGetStackHighWaterMark(NULL),
                      (unsigned long)voice_stack_free(),
-                     (unsigned long)voice_dropped());
+                     (unsigned long)voice_dropped(),
+                     (unsigned long)s_blit_timeouts);
             fps_t0 = t;
             us_sim = us_draw = us_blit = 0;
             frames = 0;
         }
         vTaskDelay(1);  // let the idle task run so the watchdog stays happy
+    }
+}
+
+// Independent of the render loop, so it can tell "the worm task stopped" apart
+// from "the USB-JTAG console stopped accepting writes" — the log goes quiet
+// after ~11 s and those two look identical from the host end.
+static void heartbeat_task(void *arg) {
+    for (uint32_t i = 0;; i++) {
+        ESP_LOGI("beat", "%lu | tick %lld | frames %lu | stage %d band %d",
+                 (unsigned long)i, (long long)(s_world ? s_world->tick_count : 0),
+                 (unsigned long)s_frames_total, s_stage, s_stage_band);
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -182,6 +228,10 @@ void app_main(void) {
     // whole 466x466 frame itself, so LVGL would only add a copy.
     esp_lcd_panel_io_handle_t io = NULL;
     ESP_ERROR_CHECK(bsp_display_new(NULL, &s_panel, &io));
+    s_io = io;
+    s_blit_done = xSemaphoreCreateBinary();
+    const esp_lcd_panel_io_callbacks_t cbs = {.on_color_trans_done = on_color_done};
+    ESP_ERROR_CHECK(esp_lcd_panel_io_register_event_callbacks(s_io, &cbs, NULL));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
     bsp_display_brightness_init();
     bsp_display_brightness_set(100);
@@ -260,4 +310,5 @@ void app_main(void) {
     }
 
     xTaskCreatePinnedToCore(worm_task, "worm", 8192, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(heartbeat_task, "beat", 3072, NULL, 2, NULL, 0);
 }
