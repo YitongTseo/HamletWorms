@@ -197,3 +197,10 @@ int wm_world_drain_eaten(wm_world *w, wm_eaten *out, int cap) {
     w->n_eaten = 0;
     return n;
 }
+
+void wm_world_poke(wm_world *w) {
+    // Exactly what _check_walls does on contact: raise the flag and hold it for
+    // the linger window, so the next brain tick fires the mechanosensors.
+    w->stim_nose_touch = true;
+    w->stim_linger_until = w->tick_count + WM_STIM_LINGER_TICKS;
+}

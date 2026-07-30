@@ -14,6 +14,8 @@
 // including esp_err.h itself, so it only compiles behind the umbrella header.
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
+#include "bsp/touch.h"
+#include "esp_lcd_touch.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
@@ -32,6 +34,9 @@ static const char *TAG = "worm";
 
 static esp_lcd_panel_handle_t s_panel;
 static esp_lcd_panel_io_handle_t s_io;
+static esp_lcd_touch_handle_t s_touch;
+static bool s_was_touched;
+static uint32_t s_pokes;
 
 // esp_lcd_panel_draw_bitmap only QUEUES the transfer; the DMA reads the buffer
 // afterwards. The renderer was handing it a band and immediately overwriting
@@ -196,6 +201,27 @@ static void worm_task(void *arg) {
             ticks++;
         }
 
+        // --- touch ------------------------------------------------------
+        // Polled here rather than on the interrupt: at 15 fps the render loop
+        // already samples faster than a finger moves, and this keeps the I2C
+        // traffic on one task.
+        bool touched = false;
+        if (s_touch) {
+            uint16_t tx[1], ty[1];
+            uint8_t cnt = 0;
+            esp_lcd_touch_read_data(s_touch);
+            touched = esp_lcd_touch_get_coordinates(s_touch, tx, ty, NULL, &cnt, 1) && cnt > 0;
+        }
+        s_ctx.invert = touched;
+        if (touched && !s_was_touched) {
+            // Rising edge only: hold a finger down and the worm recoils once,
+            // rather than being pinned in a permanent escape response.
+            wm_world_poke(s_world);
+            s_ctx.shudder = 1.0f;
+            s_pokes++;
+        }
+        s_was_touched = touched;
+
         // Decay on elapsed time, not per frame, so the flash lasts the same
         // ~0.2 s whether the renderer is managing 10 fps or 20.
         float dt = (float)(t_loop0 - last_us) / 1e6f;
@@ -208,6 +234,8 @@ static void worm_task(void *arg) {
             if (s_ctx.title_alpha < 0.0f) s_ctx.title_alpha = 0.0f;
         }
         if (s_ctx.flash < 0.002f) s_ctx.flash = 0.0f;
+        s_ctx.shudder -= s_ctx.shudder * dt * 6.0f;
+        if (s_ctx.shudder < 0.002f) s_ctx.shudder = 0.0f;
 
         int64_t t_a = esp_timer_get_time();
         s_stage = 1;
@@ -227,14 +255,15 @@ static void worm_task(void *arg) {
             int64_t t = esp_timer_get_time();
             ESP_LOGI(TAG,
                      "%.1f fps | sim %.0f  draw %.0f ms | tick %lld | "
-                     "stack worm %u voice %lu | dropped %lu | blit-to %lu",
+                     "stack worm %u voice %lu | dropped %lu | blit-to %lu | pokes %lu",
                      60.0 * 1e6 / (double)(t - fps_t0),
                      us_sim / 60000.0, us_draw / 60000.0,
                      (long long)s_world->tick_count,
                      (unsigned)uxTaskGetStackHighWaterMark(NULL),
                      (unsigned long)voice_stack_free(),
                      (unsigned long)voice_dropped(),
-                     (unsigned long)s_blit_timeouts);
+                     (unsigned long)s_blit_timeouts,
+                     (unsigned long)s_pokes);
             fps_t0 = t;
             us_sim = us_draw = us_blit = 0;
             frames = 0;
@@ -280,6 +309,11 @@ void app_main(void) {
     }
     ESP_LOGI(TAG, "spi max transaction %u B -> %d rows per band (%d bands)",
              (unsigned)max_trans, s_band_rows, (WR_H + s_band_rows - 1) / s_band_rows);
+
+    if (bsp_touch_new(NULL, &s_touch) != ESP_OK) {
+        ESP_LOGW(TAG, "no touch controller; the worm cannot be poked");
+        s_touch = NULL;
+    }
 
     if (!mount_worm()) return;
 
@@ -338,7 +372,10 @@ void app_main(void) {
             .sample_rate = 8000, .channel = 1, .bits_per_sample = 16,
         };
         esp_codec_dev_open(spk, &fs);
-        esp_codec_dev_set_out_vol(spk, 100);  // plus 2.5x digital gain in voice.c
+        // The bank is speech-normalised now, so this is the only loudness knob that
+        // matters. 55 of 100 — the words are close to full scale coming out of
+        // flash, and the panel speaker is small enough that 100 was shouting.
+        esp_codec_dev_set_out_vol(spk, 55);
         if (voice_init(spk)) voice_start();
     } else {
         ESP_LOGW(TAG, "no speaker; the worm will eat in silence");

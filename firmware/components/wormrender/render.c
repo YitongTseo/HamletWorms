@@ -482,8 +482,16 @@ static void band_mask(wr_ctx *c, int y0, int h) {
 }
 
 void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user) {
+    c->frame++;
     c->cam_x = (float)w->body.target_x;
     c->cam_y = (float)w->body.target_y;
+    if (c->shudder > 0.001f) {
+        // Two incommensurate frequencies so it reads as a jitter rather than a
+        // wobble. Camera only — the body itself is the simulation's business.
+        float t = (float)c->frame;
+        c->cam_x += c->shudder * 7.0f * sinf(t * 2.7f) / scale_of(c);
+        c->cam_y += c->shudder * 7.0f * sinf(t * 3.9f + 1.3f) / scale_of(c);
+    }
     c->cov_pixels = 0;
 
     // Project the midline once for the whole frame. It is 201 points, and
@@ -560,6 +568,11 @@ void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user) {
                             WR_W * 0.5f, WR_H * 0.5f + 20.0f, WR_ACCENT,
                             a * 170 / 255, 2.0f);
         }
+        // Before the mask, so the corners outside the panel stay black
+        // instead of flashing white.
+        if (c->invert)
+            for (size_t i = 0; i < n; i++) c->band[i] = (uint16_t)~c->band[i];
+
         if (c->round_mask) band_mask(c, y0, h);
 
         blit(user, y0, h, c->band);

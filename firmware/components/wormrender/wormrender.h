@@ -93,6 +93,16 @@ typedef struct {
     const char *subtitle;  // flask and generation
     float title_alpha;     // 0..1, driven by the caller
 
+    // Held while a finger is down. A straight XOR of the framebuffer, so the
+    // ground goes white, the words black and the animal magenta — unmistakable,
+    // and one instruction per pixel.
+    bool invert;
+
+    // Decays after a poke. Jitters the camera, which reads as the worm
+    // flinching without touching the simulation's own state.
+    float shudder;
+    uint32_t frame;  // drives the jitter; bumped by wr_draw_banded
+
     bool round_mask;  // zero the corners outside the circular panel
 
     uint32_t cov_pixels;  // body pixels drawn last frame (diagnostic)

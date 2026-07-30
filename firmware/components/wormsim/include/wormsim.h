@@ -251,6 +251,16 @@ void wm_world_init(wm_world *w, const wm_asset *a, uint32_t seed, void *storage)
 void wm_world_tick(wm_world *w);
 int wm_world_drain_eaten(wm_world *w, wm_eaten *out, int cap);
 
+// Poke the worm. Raises the same nose-touch stimulus a wall collision does, so
+// the escape response comes out of the connectome's own FLPL/FLPR/ASHL/ASHR/
+// OLQ neurons rather than being animated on top of it — those are the
+// mechanosensors the real animal recoils with.
+//
+// This does change the worm's life, and therefore its poem. A poked board no
+// longer matches its server-side twin. That is the correct trade for something
+// meant to be touched, but it is a trade.
+void wm_world_poke(wm_world *w);
+
 // ---------------------------------------------------------------------------
 // Chemosensation — the embedding forward pass, minus the 512->11 projection
 // that tools/bake.py already folded into asset.etable.
