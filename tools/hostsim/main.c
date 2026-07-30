@@ -39,6 +39,30 @@ int main(int argc, char **argv) {
     fprintf(stderr, "asset: %u vocab, %u neurons, %u edges, %u sentences, %u tokens, seed %u\n",
             a.n_vocab, a.n_neurons, a.n_edges, a.n_sentences, a.n_tokens, a.seed);
 
+    // Probe mode: dump the 12-dim chemosensory vector for a handful of
+    // (word, history) pairs so tools/embedprobe.py can diff them against
+    // embed_batch() bit for bit. Isolates the embedding forward pass from the
+    // rest of the sim when hunting a divergence.
+    if (argc > 4 && strcmp(argv[4], "embed") == 0) {
+        uint32_t probes[][6] = {
+            {100, 0, 0, 0, 0, 0}, {101, 100, 0, 0, 0, 0},
+            {205, 100, 101, 0, 0, 0}, {311, 205, 100, 101, 102, 0},
+            {412, 311, 205, 100, 101, 102}, {77, 412, 311, 205, 100, 101},
+        };
+        int n_hist[] = {0, 1, 2, 4, 5, 5};
+        for (int p = 0; p < 6; p++) {
+            double pca[WM_N_PC];
+            if (!wm_chemo_embed(&a, probes[p][0], &probes[p][1], n_hist[p], pca)) {
+                printf("PROBE %u OOV\n", probes[p][0]);
+                continue;
+            }
+            printf("PROBE %u %d", probes[p][0], n_hist[p]);
+            for (int i = 0; i < WM_N_PC; i++) printf(" %a", pca[i]);
+            printf("\n");
+        }
+        return 0;
+    }
+
     wm_world *w = malloc(sizeof(wm_world));
     void *storage = malloc(wm_world_bytes(&a));
     wm_world_init(w, &a, a.seed, storage);

@@ -51,9 +51,12 @@ def run_python(ticks: int, state_every: int, gen_dir: Path, seed: int,
             out.append(f"EAT {w.tick_count} {line_id} {word_idx} {word}")
         if state_every > 0 and (t % state_every) == 0:
             b = w.worm
+            # float() each: _check_walls assigns the literal int 0 on a clamp
+            # (`self.worm.target_x = 0`), so these are not always floats.
+            # Numerically identical to the C side's 0.0.
             out.append(
-                f"STATE {w.tick_count} {b.target_x.hex()} {b.target_y.hex()} "
-                f"{b.facing_dir.hex()} {float(b.speed).hex()}"
+                f"STATE {w.tick_count} {float(b.target_x).hex()} {float(b.target_y).hex()} "
+                f"{float(b.facing_dir).hex()} {float(b.speed).hex()}"
             )
     out.append(f"END {w.tick_count}")
     return out
