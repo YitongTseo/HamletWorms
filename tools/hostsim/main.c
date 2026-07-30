@@ -77,6 +77,11 @@ int main(int argc, char **argv) {
             if (w->scroller.lines[li].n_words > max_words)
                 max_words = w->scroller.lines[li].n_words;
 
+        if (wm_scroller_exhausted(&w->scroller)) {
+            fprintf(stderr, "corpus exhausted at tick %lld\n", (long long)w->tick_count);
+            break;
+        }
+
         wm_eaten got[WM_EATEN_CAP];
         int n = wm_world_drain_eaten(w, got, WM_EATEN_CAP);
         for (int i = 0; i < n; i++) {

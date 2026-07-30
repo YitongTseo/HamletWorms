@@ -51,6 +51,8 @@ static bool IRAM_ATTR on_color_done(esp_lcd_panel_io_handle_t io,
 static wm_asset s_asset;
 static wm_world *s_world;
 static wr_ctx s_ctx;
+static void *s_world_storage;
+static uint32_t s_generation;
 static char s_title[32], s_subtitle[64];
 static volatile uint32_t s_frames_total;
 // Where the worm task last was. The heartbeat prints it, so a hang says which
@@ -169,6 +171,27 @@ static void worm_task(void *arg) {
                 s_ctx.flash = 1.0f;  // neurons fire, ring leaves the head
             }
 
+            // One pass of the play is one generation: 5498 sentences at a
+            // 4.5 s spawn interval, about 6.9 hours. The scroller does not loop
+            // (that is what the server does when it is evolving), so without
+            // this the worm would spend the rest of its life crawling an empty
+            // field. Re-seeding with the same seed replays the same life
+            // exactly, which is what a board with no network should do until
+            // new weights arrive.
+            if (wm_scroller_exhausted(&s_world->scroller)) {
+                s_generation++;
+                ESP_LOGI(TAG, "corpus exhausted at tick %lld; beginning pass %lu",
+                         (long long)s_world->tick_count, (unsigned long)s_generation + 1);
+                wm_world_init(s_world, &s_asset, s_asset.seed, s_world_storage);
+                for (int k = 0; k < WARMUP_TICKS; k++) wm_world_tick(s_world);
+                wm_eaten drop[WM_EATEN_CAP];
+                wm_world_drain_eaten(s_world, drop, WM_EATEN_CAP);
+                s_ctx.title_alpha = 1.0f;   // name itself again
+                s_hold = 2.5f;
+                next_tick_us = esp_timer_get_time();
+                break;
+            }
+
             next_tick_us += 1000000 / WM_BODY_TICK_HZ;
             ticks++;
         }
@@ -285,6 +308,7 @@ void app_main(void) {
         return;
     }
 
+    s_world_storage = storage;
     wm_world_init(s_world, &s_asset, s_asset.seed, storage);
     wr_build_globe(globe);
     wr_init(&s_ctx, scratch, s_band_rows, globe);
