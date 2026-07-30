@@ -35,10 +35,13 @@ static const int8_t INDEX[16] = {-1, -1, -1, -1, 2, 4, 6, 8,
 
 #define PCM_CHUNK 512  // samples handed to the codec at a time
 
-// Digital gain applied before the codec, on top of the codec's own volume.
-// 5/2 = 2.5x. Clipping is saturated, so overshoot dulls rather than cracks.
-#define VOICE_GAIN_NUM 5
-#define VOICE_GAIN_DEN 2
+// Playback gain. 1:1 — loudness is handled in the bank by tools/voices.py,
+// which speech-normalises each word before encoding. Gain here can only clip:
+// the words already reach ~0.97 of full scale, and a sample that wraps is a
+// loud click. Left as a knob rather than deleted, since the codec volume and
+// this are the only two places loudness can be touched at runtime.
+#define VOICE_GAIN_NUM 1
+#define VOICE_GAIN_DEN 1
 
 struct voice {
     const uint8_t *bank;      // mmapped `voices` partition
@@ -167,10 +170,9 @@ static void speak_blocking(uint16_t vocab_id) {
         int n = decode_block(p + consumed, nbytes, block);
         consumed += nbytes;
 
-        // `say` renders well below full scale and the onboard speaker is tiny,
-        // so lift the whole word before it reaches the codec. Saturating rather
-        // than wrapping — a wrapped sample is a loud click.
-        for (int i = 0; i < n; i++) {
+        // Saturating, never wrapping. At 1:1 this is a no-op the compiler
+        // folds away; it exists so raising VOICE_GAIN_NUM stays safe.
+        for (int i = 0; VOICE_GAIN_NUM != VOICE_GAIN_DEN && i < n; i++) {
             int32_t v = (int32_t)block[i] * VOICE_GAIN_NUM / VOICE_GAIN_DEN;
             block[i] = v > 32767 ? 32767 : (v < -32768 ? -32768 : (int16_t)v);
         }

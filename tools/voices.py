@@ -50,6 +50,16 @@ TRIM = ("silenceremove=start_periods=1:start_threshold=-40dB:"
         "silenceremove=start_periods=1:start_threshold=-40dB:"
         "start_silence=0.01:detection=peak,areverse")
 
+# Loudness is fixed here, in the bank, not with a gain knob at playback.
+# `say` output peaks around half full scale but averages far below it — a crest
+# factor of roughly 8 — so simply multiplying on the way to the codec clips the
+# peaks off 85% of words without making them meaningfully louder. speechnorm is
+# built for exactly this: it lifts speech toward full scale envelope by
+# envelope, and the limiter catches what is left. Measured over a sample:
+# RMS 1.7x to 3.9x higher, peaks still under full scale. The quiet words gain
+# the most, which is the point — "ghost" was half the level of "sorrow".
+NORMALIZE = "speechnorm=e=12.5:r=0.0001:l=1,alimiter=limit=0.97"
+
 
 def render_one(args) -> tuple[int, bytes, dict]:
     idx, word, voice, rate, codec, sr, tmpdir = args
@@ -73,7 +83,7 @@ def render_one(args) -> tuple[int, bytes, dict]:
         enc = ["-c:a", "libopus", "-b:a", "24k", "-vbr", "on", "-application", "audio"]
 
     subprocess.run(
-        ["ffmpeg", "-loglevel", "error", "-y", "-i", str(aiff), "-af", TRIM,
+        ["ffmpeg", "-loglevel", "error", "-y", "-i", str(aiff), "-af", TRIM + "," + NORMALIZE,
          "-ar", str(sr), "-ac", "1", *enc, str(out)],
         capture_output=True, check=False,
     )

@@ -67,8 +67,15 @@ int main(int argc, char **argv) {
     void *storage = malloc(wm_world_bytes(&a));
     wm_world_init(w, &a, a.seed, storage);
 
+    int max_lines = 0, max_words = 0;
     for (long t = 0; t < n_ticks; t++) {
         wm_world_tick(w);
+        // The scroller has fixed line slots; if either of these ever reaches
+        // its cap a sentence gets skipped or truncated silently.
+        if (w->scroller.n_lines > max_lines) max_lines = w->scroller.n_lines;
+        for (int li = 0; li < w->scroller.n_lines; li++)
+            if (w->scroller.lines[li].n_words > max_words)
+                max_words = w->scroller.lines[li].n_words;
 
         wm_eaten got[WM_EATEN_CAP];
         int n = wm_world_drain_eaten(w, got, WM_EATEN_CAP);
@@ -85,6 +92,8 @@ int main(int argc, char **argv) {
         }
     }
 
+    fprintf(stderr, "peak %d/%d active lines, %d/%d words per line\n",
+            max_lines, WM_MAX_ACTIVE_LINES, max_words, WM_MAX_LINE_WORDS);
     printf("END %lld\n", (long long)w->tick_count);
     return 0;
 }
