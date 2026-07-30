@@ -119,26 +119,40 @@ On the board:
 
 ## Performance
 
-Measured on the board, per frame: **sim 12 ms, draw 60 ms, ~13 fps**, with the
-simulation holding a true 60 Hz.
+Measured on the board: **12–20 fps**, with the simulation holding **60.00 Hz**
+exactly (36,001 ticks in 600 s). The tick rate is the number that matters — it
+is the rate the server-side twin runs at too.
 
-Two findings that only the hardware could give:
+Four findings, none of which the host preview could have produced:
 
 - The renderer ran in float64 like the sim and took **2.7 s a frame**. The S3's
   FPU is single-precision only, so ~400k `sqrt`/`hypot` calls a frame were
   software-emulated. Nothing in the rasteriser feeds the simulation, so nothing
   there needs float64.
-- Then it took **286–475 ms** against 28 ms of actual transfer, because it drew
-  into a PSRAM framebuffer. PSRAM is punishing for the scattered single-byte
-  writes the coverage pass does. It now renders one band at a time in internal
-  SRAM and DMAs each band straight out; there is no framebuffer at all.
+- Then it took **286–475 ms** against 28 ms of transfer, because it drew into a
+  PSRAM framebuffer. PSRAM is punishing for the scattered single-byte writes the
+  coverage pass does. It now renders a band at a time in internal SRAM; there is
+  no framebuffer at all.
+- A whole-frame blit is illegal here regardless: 434 KB is over the SPI bus's
+  32 KB max transaction, so esp_lcd splits it and sets
+  `SPI_TRANS_CS_KEEP_ACTIVE`, which `spi_master.c` rejects unless the bus was
+  acquired with `spi_device_acquire_bus()` — which esp_lcd never does. Band
+  height comes from `spi_bus_get_max_transaction_len()`. The SRAM budget and the
+  bus limit happen to want the same number.
+- **`esp_lcd_panel_draw_bitmap` only queues the transfer.** The DMA reads the
+  buffer after it returns. Handing it a band and immediately drawing the next
+  one into that same buffer corrupted output silently and then wedged the task
+  forever, ~100 frames in, inside `spi_device_get_trans_result` — which esp_lcd
+  waits on with `portMAX_DELAY`. Two alternating band buffers, an
+  `on_color_trans_done` semaphore, and a *bounded* wait fix it: a lost
+  completion costs one frame, not the animal.
 
-A whole-frame blit is also simply illegal here: 434 KB is over the SPI bus's
-32 KB max transaction, so esp_lcd splits it and sets `SPI_TRANS_CS_KEEP_ACTIVE`,
-which `spi_master.c` rejects unless the bus was acquired with
-`spi_device_acquire_bus()` — which esp_lcd never does. Band height is queried
-from `spi_bus_get_max_transaction_len()` at startup. The two constraints happen
-to want the same number.
+That last one presented as a dead serial console. What separated "the app hung"
+from "the console stopped" was a heartbeat task pinned to the other core: it
+kept printing while the worm task's tick and frame counters sat frozen. A stage
+counter in the same log then named the exact call. Both are still in the build —
+the fps line carries stack high-water marks for both tasks, dropped words, and
+blit timeouts, so the next thing to go wrong says so instead of going quiet.
 
 ## Fidelity
 
