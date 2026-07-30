@@ -1,0 +1,11 @@
+build/
+tools/nltk_data/
+tools/hostsim/hostsim
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+voice/raw/
+voice/enc/
+*.o
+.DS_Store
