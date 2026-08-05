@@ -1,10 +1,12 @@
-# Name,     Type, SubType, Offset,   Size,    Flags
-# 16 MB flash, no SD card: the voice bank and the worm both live here.
-#   worm asset  1.02 MB  ->  1.5 M partition
-#   voice bank 10.47 MB  ->   11 M partition
-# 0x10000 + 3M + 1.5M + 11M = 0xF90000, inside 16 MB with ~450 KB spare.
+# Name,     Type, SubType, Offset,   Size,     Flags
+# 16 MB flash, no SD card. Slowing the speech from 205 to 180 wpm grew the bank
+# from 10.47 to 12.98 MB, so the layout is now sized around it:
+#   0x10000 + 1.5M app + 1.25M worm + 13504K voices = exactly 16 MB.
+# App is ~430 KB today and needs room for the wifi stack; worm asset is 1.03 MB.
+# Spare in the voice partition is ~215 KB, so a slower voice than this needs
+# either Opus (about half the size) or a smaller app.
 nvs,        data, nvs,     0x9000,   0x6000,
 phy_init,   data, phy,     0xf000,   0x1000,
-factory,    app,  factory, 0x10000,  3M,
-worm,       data, 0x40,    ,         1536K,
-voices,     data, 0x41,    ,         11M,
+factory,    app,  factory, 0x10000,  1536K,
+worm,       data, 0x40,    ,         1280K,
+voices,     data, 0x41,    ,         13504K,

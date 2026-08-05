@@ -163,6 +163,12 @@ bool wm_asset_open(wm_asset *a, const void *data, size_t size) {
     a->muscle_side = (const uint8_t *)take(&c, a->n_muscle_visits);
     if (!c.ok) return false;
 
+    if (find_section(d, size, n_sections, "NEURONXY", &c)) {
+        a->neuron_axial = (const float *)take(&c, 4 * a->n_neurons);
+        a->neuron_lateral = (const float *)take(&c, 4 * a->n_neurons);
+        if (!c.ok) { a->neuron_axial = NULL; a->neuron_lateral = NULL; }
+    }
+
     if (!find_section(d, size, n_sections, "PRESYN", &c)) return false;
     a->n_presyn = take_u32(&c);
     a->presyn_idx = (const uint16_t *)take(&c, 2 * a->n_presyn);

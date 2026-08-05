@@ -63,7 +63,8 @@ int main(int argc, char **argv) {
     ctx.subtitle = "flask_1  gen-0007";
     ctx.title_alpha = 1.0f;
     float hold = 2.5f;
-    ctx.invert = getenv("WR_INVERT") != NULL;   // preview the touch state
+    ctx.invert = getenv("WR_INVERT") != NULL;   // preview the touch states
+    ctx.xray = getenv("WR_XRAY") != NULL;
 
     for (int i = 0; i < n_frames; i++) {
         for (int t = 0; t < per_frame; t++) {

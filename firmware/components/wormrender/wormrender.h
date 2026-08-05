@@ -99,7 +99,14 @@ typedef struct {
     // Held while a finger is down. A straight XOR of the framebuffer, so the
     // ground goes white, the words black and the animal magenta — unmistakable,
     // and one instruction per pixel.
+    // Held while a finger is down. A straight XOR of the framebuffer. Left in
+    // and wired, but off by default now that touch shows the x-ray instead —
+    // the two fight for the same pixels.
     bool invert;
+
+    // Held while a finger is down: dim the body and light the connectome
+    // inside it, the way viewer/focus/xray-render.js does.
+    bool xray;
 
     // Decays after a poke. Jitters the camera, which reads as the worm
     // flinching without touching the simulation's own state.
@@ -122,6 +129,11 @@ typedef void (*wr_blit_fn)(void *user, int y, int h, const uint16_t *pixels);
 
 // Scratch for one band: pixels + coverage + body position. Put it in internal
 // SRAM — that is the entire point of banding.
+// Per-stage timing in microseconds, accumulated across bands. Point wr_clock at
+// a microsecond source to enable.
+extern uint32_t wr_us_frame, wr_us_words, wr_us_worm;
+extern uint32_t (*wr_clock)(void);
+
 size_t wr_scratch_bytes(int band_rows);
 
 // One alpha byte per pixel. Built once at startup; PSRAM is fine, it is only

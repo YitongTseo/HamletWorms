@@ -189,10 +189,28 @@ static void speak_blocking(uint16_t vocab_id) {
     }
 }
 
+// Silence written after each word. The queue plays words back to back, which
+// ran them together into one stream — a gap this side of the codec costs no
+// flash and does more for making the worm intelligible than slowing the speech
+// down does.
+#define VOICE_GAP_MS 190
+
+static void speak_gap(void) {
+    static int16_t silence[256];
+    int total = (int)V.sample_rate * VOICE_GAP_MS / 1000;
+    for (int i = 0; i < total; i += 256) {
+        int chunk = total - i < 256 ? total - i : 256;
+        esp_codec_dev_write(V.codec, silence, chunk * sizeof(int16_t));
+    }
+}
+
 static void voice_task(void *arg) {
     uint16_t id;
     for (;;) {
-        if (xQueueReceive(V.q, &id, portMAX_DELAY) == pdTRUE) speak_blocking(id);
+        if (xQueueReceive(V.q, &id, portMAX_DELAY) == pdTRUE) {
+            speak_blocking(id);
+            speak_gap();
+        }
     }
 }
 

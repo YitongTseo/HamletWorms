@@ -85,6 +85,11 @@ class Blob:
     def arr_u32(self, vals):
         self.buf += np.asarray(vals, dtype="<u4").tobytes()
 
+    def arr_f32(self, vals):
+        # Only for values that never feed the simulation — the x-ray anchors are
+        # cosmetic, so float32 is plenty and halves the table.
+        self.buf += np.asarray(vals, dtype="<f4").ravel().tobytes()
+
     def arr_f64(self, vals):
         # float64, not float32, everywhere a value feeds arithmetic. Python and
         # numpy are float64 throughout; the connectome's fire test is a hard
@@ -301,6 +306,23 @@ def main() -> None:
     presyn = [nidx[n] for n in weights.keys()]
     b = Blob(); b.u32(len(presyn)); b.arr_u16(presyn); b.align(4)
     S.append(("PRESYN", bytes(b.buf)))
+
+    # Where each neuron sits on the animal, for the x-ray. Same anchors the
+    # site uses (viewer/focus/xray-render.js): axial in [0,1] head to tail,
+    # lateral in [-1,1] across the body. The connectome has 396 entries once the
+    # muscles are folded in and the coordinate table has 301, so anything
+    # missing gets axial = -1 and is skipped at render time.
+    coords_path = V7 / "cache" / "neuron_body_coords.json"
+    coords = json.loads(coords_path.read_text())["neurons"] if coords_path.exists() else {}
+    axial, lateral = [], []
+    for n in neurons:
+        c_ = coords.get(n)
+        axial.append(c_["axial"] if c_ else -1.0)
+        lateral.append(c_["lateral"] if c_ else 0.0)
+    placed = sum(1 for a in axial if a >= 0.0)
+    print(f"xray    {placed}/{len(neurons)} neurons have body coordinates")
+    b = Blob(); b.arr_f32(axial); b.arr_f32(lateral)
+    S.append(("NEURONXY", bytes(b.buf)))
 
     b = Blob()
     for L, R in PC_NEURON_PAIRS:

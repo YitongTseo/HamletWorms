@@ -212,7 +212,11 @@ static void worm_task(void *arg) {
             esp_lcd_touch_read_data(s_touch);
             touched = esp_lcd_touch_get_coordinates(s_touch, tx, ty, NULL, &cnt, 1) && cnt > 0;
         }
-        s_ctx.invert = touched;
+        // Touch shows the connectome rather than inverting. The inversion is
+        // still wired (wr_ctx.invert) but off: white ground and lit neurons
+        // fight for the same pixels, and the x-ray is the more interesting of
+        // the two to have under your finger.
+        s_ctx.xray = touched;
         if (touched && !s_was_touched) {
             // Rising edge only: hold a finger down and the worm recoils once,
             // rather than being pinned in a permanent escape response.
@@ -255,15 +259,15 @@ static void worm_task(void *arg) {
             int64_t t = esp_timer_get_time();
             ESP_LOGI(TAG,
                      "%.1f fps | sim %.0f  draw %.0f ms | tick %lld | "
-                     "stack worm %u voice %lu | dropped %lu | blit-to %lu | pokes %lu",
+                     "frame %lu words %lu worm %lu ms | stack %u | pokes %lu",
                      60.0 * 1e6 / (double)(t - fps_t0),
                      us_sim / 60000.0, us_draw / 60000.0,
                      (long long)s_world->tick_count,
+                     (unsigned long)(wr_us_frame / 60000), (unsigned long)(wr_us_words / 60000),
+                     (unsigned long)(wr_us_worm / 60000),
                      (unsigned)uxTaskGetStackHighWaterMark(NULL),
-                     (unsigned long)voice_stack_free(),
-                     (unsigned long)voice_dropped(),
-                     (unsigned long)s_blit_timeouts,
                      (unsigned long)s_pokes);
+            wr_us_frame = wr_us_words = wr_us_worm = 0;
             fps_t0 = t;
             us_sim = us_draw = us_blit = 0;
             frames = 0;
@@ -275,6 +279,8 @@ static void worm_task(void *arg) {
 // Independent of the render loop, so it can tell "the worm task stopped" apart
 // from "the USB-JTAG console stopped accepting writes" — the log goes quiet
 // after ~11 s and those two look identical from the host end.
+static uint32_t us_now(void) { return (uint32_t)esp_timer_get_time(); }
+
 static void heartbeat_task(void *arg) {
     for (uint32_t i = 0;; i++) {
         ESP_LOGI("beat", "%lu | tick %lld | frames %lu | stage %d band %d",
@@ -334,18 +340,18 @@ void app_main(void) {
     uint8_t *scratch = heap_caps_malloc(wr_scratch_bytes(s_band_rows),
                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
 
-    // The graticule is built once and only ever read sequentially, so PSRAM is
-    // the right home for its 217 KB.
-    uint8_t *globe = heap_caps_malloc(wr_globe_bytes(), MALLOC_CAP_SPIRAM);
-    if (!s_world || !storage || !scratch || !globe) {
+    if (!s_world || !storage || !scratch) {
         ESP_LOGE(TAG, "out of PSRAM");
         return;
     }
 
     s_world_storage = storage;
     wm_world_init(s_world, &s_asset, s_asset.seed, storage);
-    wr_build_globe(globe);
-    wr_init(&s_ctx, scratch, s_band_rows, globe);
+    // The frame is world-space line work now, not a screen-space mask: this
+    // just precomputes its world coordinates.
+    wr_clock = us_now;
+    wr_build_globe(NULL);
+    wr_init(&s_ctx, scratch, s_band_rows, NULL);
 
     meta_field(s_asset.meta, "worm", s_title, sizeof(s_title));
     char flask[24], gen[24];

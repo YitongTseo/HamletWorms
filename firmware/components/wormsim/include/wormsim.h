@@ -87,6 +87,12 @@ typedef struct {
     const double *syn_w;
     uint32_t n_edges;
 
+    // Where each neuron sits on the animal, for the x-ray. axial in [0,1] head
+    // to tail, lateral in [-1,1] across it; axial < 0 means this entry (a
+    // muscle, mostly) has no anatomical anchor.
+    const float *neuron_axial;
+    const float *neuron_lateral;
+
     uint32_t n_presyn;
     const uint16_t *presyn_idx;  // weights.json key order, for rand_excite
 

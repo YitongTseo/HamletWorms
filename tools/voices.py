@@ -58,7 +58,13 @@ TRIM = ("silenceremove=start_periods=1:start_threshold=-40dB:"
 # envelope, and the limiter catches what is left. Measured over a sample:
 # RMS 1.7x to 3.9x higher, peaks still under full scale. The quiet words gain
 # the most, which is the point — "ghost" was half the level of "sorrow".
-NORMALIZE = "speechnorm=e=12.5:r=0.0001:l=1,alimiter=limit=0.97"
+# A presence lift before normalising. At 8 kHz the whole consonant range is
+# crowded into the top octave, and /s/ /t/ /f/ are what carry a word apart from
+# its neighbours — boosting there does more for making the worm intelligible
+# than slowing it down does.
+PRESENCE = "highshelf=f=1700:g=4"
+
+NORMALIZE = PRESENCE + ",speechnorm=e=12.5:r=0.0001:l=1,alimiter=limit=0.97"
 
 
 def render_one(args) -> tuple[int, bytes, dict]:
@@ -130,7 +136,7 @@ def strip_wav(buf: bytes) -> tuple[bytes, dict]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--voice", default="Daniel", help="macOS voice; Daniel is en_GB")
-    ap.add_argument("--rate", type=int, default=205, help="words per minute")
+    ap.add_argument("--rate", type=int, default=180, help="words per minute")
     ap.add_argument("--codec", choices=("adpcm", "opus"), default="adpcm")
     ap.add_argument("--sr", type=int, default=8000)
     ap.add_argument("-j", "--jobs", type=int, default=6)
