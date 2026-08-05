@@ -31,8 +31,6 @@ size_t wr_scratch_bytes(int band_rows) {
     return (size_t)WR_W * band_rows * (2 + 2 + 1 + 1);
 }
 
-size_t wr_globe_bytes(void) { return (size_t)WR_W * WR_H; }
-
 static inline uint16_t to565(uint32_t c) {
     return (uint16_t)((((c >> 16) & 0xFF) >> 3) << 11 |
                       (((c >> 8) & 0xFF) >> 2) << 5 |
@@ -52,9 +50,9 @@ static inline void blend(uint16_t *px, uint32_t c, uint32_t a) {
                      (((sb * a + db * ia) * 257) >> 16));
 }
 
-// Precomputed composites, both rebuilt only when their inputs change.
-static uint16_t globe_lut[256];   // WR_GLOBE over WR_STAGE, by alpha
-static uint16_t body_lut[256];    // head->tail gradient, by position along body
+// Body colour by position along the animal, rebuilt only when the flash level
+// changes.
+static uint16_t body_lut[256];
 static uint32_t body_lut_key = 0xFFFFFFFFu;
 
 static inline uint32_t lerp_rgb(uint32_t a, uint32_t b, uint32_t m) {
@@ -62,14 +60,6 @@ static inline uint32_t lerp_rgb(uint32_t a, uint32_t b, uint32_t m) {
     return ((((a >> 16 & 0xFF) * ia + (b >> 16 & 0xFF) * m) / 255) << 16) |
            ((((a >> 8 & 0xFF) * ia + (b >> 8 & 0xFF) * m) / 255) << 8) |
            (((a & 0xFF) * ia + (b & 0xFF) * m) / 255);
-}
-
-static void build_globe_lut(void) {
-    for (int a = 0; a < 256; a++) {
-        uint16_t px = to565(WR_STAGE);
-        blend(&px, WR_GLOBE, (uint32_t)a);
-        globe_lut[a] = px;
-    }
 }
 
 void wr_init(wr_ctx *c, uint8_t *scratch, int band_rows, const uint8_t *globe) {
@@ -87,7 +77,6 @@ void wr_init(wr_ctx *c, uint8_t *scratch, int band_rows, const uint8_t *globe) {
     c->view_units = 400.0f;
     c->body_radius = WR_DEFAULT_RADIUS;
     c->round_mask = true;
-    build_globe_lut();
 }
 
 static inline float scale_of(const wr_ctx *c) { return (float)WR_W / c->view_units; }
@@ -100,79 +89,122 @@ static inline void w2s(const wr_ctx *c, float wx, float wy, float *sx, float *sy
     *sy = (wy - c->cam_y) * s + WR_H / 2.0f;
 }
 
-// --- globe graticule ---------------------------------------------------------
+// --- the frame ---------------------------------------------------------------
+//
+// A wireframe ellipsoid inscribed in the simulation's own rectangle, drawn in
+// WORLD space rather than screen space.
+//
+// The previous version was pinned to the display, which looked like a globe but
+// told you nothing: it slid along with the camera, so the worm was forever at
+// its centre. Anchoring it to the world turns it into an instrument. Its poles
+// sit on the top and bottom of the box the words live in — the line at
+// SPAWN_Y where they appear and the line at KILL_Y where they vanish — so the
+// curvature tells you where in that box the worm currently is, and the words
+// visibly rise past it.
+//
+// Extents come from the simulation constants, not from taste: x spans the full
+// WM_WORLD_W, y spans KILL_Y..SPAWN_Y.
 
-static void splat(uint8_t *mask, float x, float y, float a) {
-    int xi = (int)floorf(x), yi = (int)floorf(y);
-    float fx = x - xi, fy = y - yi;
-    for (int dy = 0; dy < 2; dy++) {
-        int py = yi + dy;
-        if (py < 0 || py >= WR_H) continue;
-        float wy = dy ? fy : 1.0f - fy;
-        for (int dx = 0; dx < 2; dx++) {
-            int px = xi + dx;
-            if (px < 0 || px >= WR_W) continue;
-            float wx = dx ? fx : 1.0f - fx;
-            uint32_t v = (uint32_t)(a * wx * wy);
-            if (v > 255) v = 255;
-            uint8_t *m = &mask[(size_t)py * WR_W + px];
-            if (v > *m) *m = (uint8_t)v;  // max, so crossings do not pile up
+#define WR_FRAME_CX (WM_WORLD_W * 0.5f)
+#define WR_FRAME_CY ((float)((WM_SPAWN_Y + WM_KILL_Y) * 0.5))
+#define WR_FRAME_A (WM_WORLD_W * 0.5f)
+#define WR_FRAME_B ((float)((WM_SPAWN_Y - WM_KILL_Y) * 0.5))
+#define WR_FRAME_TILT 0.30f
+
+#define WR_FRAME_PARALLELS 7
+#define WR_FRAME_MERIDIANS 8
+#define WR_FRAME_STEPS 64
+#define WR_FRAME_MAX_PTS ((WR_FRAME_PARALLELS + WR_FRAME_MERIDIANS) * (WR_FRAME_STEPS + 1))
+
+typedef struct {
+    float wx, wy;   // world position
+    uint8_t alpha;  // baked from depth: the far side sits behind the near side
+    uint8_t start;  // 1 = begins a new polyline
+} wr_frame_pt;
+
+static wr_frame_pt wr_frame[WR_FRAME_MAX_PTS];
+static int wr_frame_n;
+
+size_t wr_globe_bytes(void) { return 0; }  // no mask any more
+
+void wr_build_globe(uint8_t *unused) {
+    (void)unused;
+    const float ct = cosf(WR_FRAME_TILT), st = sinf(WR_FRAME_TILT);
+    // Undo the foreshortening the tilt introduces, so the poles still land
+    // exactly on SPAWN_Y and KILL_Y.
+    const float b = WR_FRAME_B / ct;
+    const float cdepth = WR_FRAME_B;
+    wr_frame_n = 0;
+
+    for (int p = 0; p < WR_FRAME_PARALLELS; p++) {
+        float lat = (-1.0f + 2.0f * (float)(p + 1) / (float)(WR_FRAME_PARALLELS + 1))
+                    * (float)M_PI * 0.5f;
+        float clat = cosf(lat), slat = sinf(lat);
+        for (int i = 0; i <= WR_FRAME_STEPS; i++) {
+            float lon = (float)i * (2.0f * (float)M_PI / (float)WR_FRAME_STEPS);
+            float x = WR_FRAME_A * clat * cosf(lon);
+            float y = b * slat;
+            float z = cdepth * clat * sinf(lon);
+            float yr = y * ct - z * st, zr = y * st + z * ct;
+            float d = zr / cdepth;
+            if (d < -1.0f) d = -1.0f;
+            if (d > 1.0f) d = 1.0f;
+            wr_frame[wr_frame_n++] = (wr_frame_pt){
+                WR_FRAME_CX + x, WR_FRAME_CY + yr,
+                (uint8_t)(64.0f + 96.0f * (d * 0.5f + 0.5f)), i == 0};
+        }
+    }
+    for (int m = 0; m < WR_FRAME_MERIDIANS; m++) {
+        float lon = (float)m * ((float)M_PI / (float)WR_FRAME_MERIDIANS);
+        float clon = cosf(lon), slon = sinf(lon);
+        for (int i = 0; i <= WR_FRAME_STEPS; i++) {
+            float lat = -(float)M_PI * 0.5f + (float)i * ((float)M_PI / (float)WR_FRAME_STEPS);
+            float clat = cosf(lat);
+            float x = WR_FRAME_A * clat * clon;
+            float y = b * sinf(lat);
+            float z = cdepth * clat * slon;
+            float yr = y * ct - z * st, zr = y * st + z * ct;
+            float d = zr / cdepth;
+            if (d < -1.0f) d = -1.0f;
+            if (d > 1.0f) d = 1.0f;
+            wr_frame[wr_frame_n++] = (wr_frame_pt){
+                WR_FRAME_CX + x, WR_FRAME_CY + yr,
+                (uint8_t)(64.0f + 96.0f * (d * 0.5f + 0.5f)), i == 0};
         }
     }
 }
 
-// A wireframe sphere under orthographic projection: parallels and meridians,
-// tilted so neither collapses to a straight line. Alpha falls off with depth so
-// the far side of the sphere sits behind the near side, which is the whole
-// reason it reads as a globe and not a flat grid.
-void wr_build_globe(uint8_t *mask) {
-    memset(mask, 0, wr_globe_bytes());
+// Thick anti-aliased line into the band. Crossings blend twice, which brightens
+// the intersections slightly — on a graticule that reads as nodes, so it is
+// left alone rather than routed through a coverage buffer.
+static void frame_line(wr_ctx *c, int y0, int h, float ax, float ay,
+                       float bx, float by, float half, uint32_t alpha) {
+    int minx = (int)floorf(fminf(ax, bx) - half - 1), maxx = (int)ceilf(fmaxf(ax, bx) + half + 1);
+    int miny = (int)floorf(fminf(ay, by) - half - 1) - y0;
+    int maxy = (int)ceilf(fmaxf(ay, by) + half + 1) - y0;
+    if (maxx < 0 || minx >= WR_W || maxy < 0 || miny >= h) return;
+    if (minx < 0) minx = 0;
+    if (miny < 0) miny = 0;
+    if (maxx >= WR_W) maxx = WR_W - 1;
+    if (maxy >= h) maxy = h - 1;
 
-    const float cx = WR_W * 0.5f, cy = WR_H * 0.5f;
-    const float R = WR_W * 0.5f - 5.0f;
-    const float tilt = 0.41f;  // ~23.5 degrees, because why not that one
-    const float ct = cosf(tilt), st = sinf(tilt);
+    float dx = bx - ax, dy = by - ay;
+    float len2 = dx * dx + dy * dy;
+    float inv = len2 > 0.0f ? 1.0f / len2 : 0.0f;
 
-    const float A_NEAR = 60.0f, A_FAR = 17.0f;
-
-    // Parallels every 30 degrees of latitude.
-    for (int p = -2; p <= 2; p++) {
-        float lat = (float)p * 30.0f * (float)M_PI / 180.0f;
-        float clat = cosf(lat), slat = sinf(lat);
-        for (int i = 0; i < 720; i++) {
-            float lon = (float)i * (2.0f * (float)M_PI / 720.0f);
-            float x = R * clat * cosf(lon);
-            float y = R * slat;
-            float z = R * clat * sinf(lon);
-            float yr = y * ct - z * st;
-            float zr = y * st + z * ct;
-            float depth = zr / R;  // -1 far .. +1 near
-            splat(mask, cx + x, cy + yr, A_FAR + (A_NEAR - A_FAR) * (depth * 0.5f + 0.5f));
+    for (int py = miny; py <= maxy; py++) {
+        uint16_t *drow = c->band + (size_t)py * WR_W;
+        float fy = (float)(py + y0) + 0.5f - ay;
+        for (int px = minx; px <= maxx; px++) {
+            float vx = (float)px + 0.5f - ax;
+            float t = (vx * dx + fy * dy) * inv;
+            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+            float ex = vx - t * dx, ey = fy - t * dy;
+            float cov = half + 0.5f - sqrtf(ex * ex + ey * ey);
+            if (cov <= 0.0f) continue;
+            if (cov > 1.0f) cov = 1.0f;
+            blend(drow + px, WR_GLOBE, (uint32_t)(cov * alpha));
         }
-    }
-
-    // Meridians every 30 degrees of longitude.
-    for (int mrd = 0; mrd < 6; mrd++) {
-        float lon = (float)mrd * 30.0f * (float)M_PI / 180.0f;
-        float clon = cosf(lon), slon = sinf(lon);
-        for (int i = 0; i <= 720; i++) {
-            float lat = -(float)M_PI / 2.0f + (float)i * ((float)M_PI / 720.0f);
-            float clat = cosf(lat);
-            float x = R * clat * clon;
-            float y = R * sinf(lat);
-            float z = R * clat * slon;
-            float yr = y * ct - z * st;
-            float zr = y * st + z * ct;
-            float depth = zr / R;
-            splat(mask, cx + x, cy + yr, A_FAR + (A_NEAR - A_FAR) * (depth * 0.5f + 0.5f));
-        }
-    }
-
-    // The limb, a touch brighter — it is the silhouette and wants to close the
-    // form rather than fade out with the rest.
-    for (int i = 0; i < 2200; i++) {
-        float a = (float)i * (2.0f * (float)M_PI / 2200.0f);
-        splat(mask, cx + R * cosf(a), cy + R * sinf(a), 74.0f);
     }
 }
 
@@ -392,20 +424,13 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
     memset(c->cov, 0, (size_t)WR_W * h);
     memset(c->seg, 0, (size_t)WR_W * h);
 
-    // Stride the capsules. Segments sit 4 world units apart — about 4.7 px
-    // here — against a body radius near 17 px, so consecutive capsules overlap
-    // almost entirely and rasterising every one is mostly redundant work. One
-    // capsule per pair covers the same area wherever the midline is locally
-    // straighter than the radius, which it is everywhere except the tightest
-    // head curl.
+    // One capsule per segment. Striding them in pairs saved about a third of
+    // the raster but left visible facets on the outer edge of the head curl,
+    // where the midline turns faster than the radius can hide.
     const int n = WM_N_SEGMENTS + 1;
-    const int stride = 2;
-    for (int i = 0; i < n - 1; i += stride) {
-        int j = i + stride < n ? i + stride : n - 1;
-        float r = rad[i] > rad[j - 1] ? rad[i] : rad[j - 1];
-        cover_segment(c, y0, h, px[i], py[i], px[j], py[j], r,
+    for (int i = 0; i < n - 1; i++)
+        cover_segment(c, y0, h, px[i], py[i], px[i + 1], py[i + 1], rad[i],
                       (uint8_t)((float)i / (float)(n - 1) * 255.0f));
-    }
 
     // Composite with a head-to-tail gradient. The anterior is paler and cooler
     // (the pharynx catching light), deepening to the body green behind it,
@@ -414,10 +439,31 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
     // animal toward white as a word goes in.
     uint32_t fm = (uint32_t)(c->flash * 95.0f);
     if (fm != body_lut_key) {
+        // One hue the whole way down. The previous ramp ran head colour into
+        // body colour over just the front 18% of the animal, which is steep
+        // enough that each capsule landed on a visibly different shade — that
+        // was the "rainbow": per-capsule quantisation of a too-fast gradient,
+        // not an intentional pattern.
+        //
+        // Now the pale anterior eases out over the first quarter, and the
+        // banding is put back deliberately as a slow brightness wave along the
+        // body — 13 bands, +-14%. C. elegans really is segmented by its
+        // body-wall muscles, so it reads as anatomy rather than as an artefact.
         uint32_t head_c = lerp_rgb(WR_HEAD, WR_FIRE, fm);
-        uint32_t tail_c = lerp_rgb(WR_ACCENT, WR_FIRE, fm);
-        for (int m = 0; m < 256; m++)
-            body_lut[m] = to565(lerp_rgb(head_c, tail_c, (uint32_t)m));
+        uint32_t body_c = lerp_rgb(WR_ACCENT, WR_FIRE, fm);
+        for (int m = 0; m < 256; m++) {
+            float t = (float)m / 255.0f;
+            float head_mix = 1.0f - t / 0.24f;
+            if (head_mix < 0.0f) head_mix = 0.0f;
+            head_mix *= head_mix;  // ease, so the transition has no visible edge
+            uint32_t base = lerp_rgb(body_c, head_c, (uint32_t)(head_mix * 255.0f));
+            float band = 0.86f + 0.14f * sinf(t * 13.0f * 2.0f * (float)M_PI);
+            uint32_t r = (uint32_t)(((base >> 16) & 0xFF) * band);
+            uint32_t g = (uint32_t)(((base >> 8) & 0xFF) * band);
+            uint32_t b = (uint32_t)((base & 0xFF) * band);
+            body_lut[m] = to565((r > 255 ? 255 : r) << 16 | (g > 255 ? 255 : g) << 8 |
+                                (b > 255 ? 255 : b));
+        }
         body_lut_key = fm;
     }
 
@@ -427,8 +473,7 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
         uint16_t *drow = c->band + (size_t)y * WR_W;
         for (int x = 0; x < WR_W; x++) {
             if (!crow[x]) continue;
-            uint32_t m = srow[x] * 255u / 46u;  // ramp over the front ~18%
-            if (m > 255u) m = 255u;
+            uint32_t m = srow[x];  // position along the body, 0 head .. 255 tail
             uint32_t a = crow[x];
             if (a >= 255) {
                 drow[x] = body_lut[m];  // the interior, which is most of it
@@ -511,6 +556,11 @@ void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user) {
     for (int i = 0; i < WM_N_SEGMENTS; i++)
         rad[i] = c->body_radius * body_profile((float)i / (float)WM_N_SEGMENTS) * sc;
 
+    // Project the frame once for the whole frame, like the midline.
+    static float fx[WR_FRAME_MAX_PTS], fy[WR_FRAME_MAX_PTS];
+    for (int i = 0; i < wr_frame_n; i++)
+        w2s(c, wr_frame[i].wx, wr_frame[i].wy, &fx[i], &fy[i]);
+
     const uint16_t stage = to565(WR_STAGE);
     float ring_r = (1.0f - c->flash) * 210.0f + 14.0f;
     uint32_t ring_a = (uint32_t)(c->flash * c->flash * 150.0f);
@@ -524,25 +574,10 @@ void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user) {
 
         for (size_t i = 0; i < n; i++) c->band[i] = stage;
 
-        if (c->globe) {
-            // The graticule is thin lines on a mostly empty mask, so test four
-            // pixels at a time and skip the empty runs whole. Rows are 466 px
-            // and bands start on multiples of 32, so both are multiples of 4.
-            const uint8_t *g = c->globe + (size_t)y0 * WR_W;
-            size_t i = 0;
-            if ((((uintptr_t)g) & 3u) == 0) {
-                const uint32_t *g4 = (const uint32_t *)g;
-                for (; i + 4 <= n; i += 4) {
-                    uint32_t quad = g4[i >> 2];
-                    if (!quad) continue;
-                    for (int k = 0; k < 4; k++) {
-                        uint8_t a = (uint8_t)(quad >> (8 * k));
-                        if (a) c->band[i + k] = globe_lut[a];
-                    }
-                }
-            }
-            for (; i < n; i++)
-                if (g[i]) c->band[i] = globe_lut[g[i]];
+        for (int i = 1; i < wr_frame_n; i++) {
+            if (wr_frame[i].start) continue;  // pen up between polylines
+            frame_line(c, y0, h, fx[i - 1], fy[i - 1], fx[i], fy[i],
+                       WR_FRAME_HALF_WIDTH, wr_frame[i].alpha);
         }
 
         band_words(c, w, y0, h);

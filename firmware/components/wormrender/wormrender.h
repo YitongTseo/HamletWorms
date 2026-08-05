@@ -32,6 +32,9 @@
 #define WR_N_GLYPHS 96  // printable ASCII 32..126, plus the em dash at slot 95
 #define WR_GLYPH_EM_DASH 95
 
+// Half-width of a graticule line, px. Thin enough to stay behind the words.
+#define WR_FRAME_HALF_WIDTH 1.15f
+
 typedef struct {
     uint16_t ax, ay;  // position in the alpha atlas
     uint8_t w, h;
@@ -53,7 +56,7 @@ extern const int wr_font_size, wr_font_ascent, wr_font_descent;
 #define WR_ACCENT 0x3DDC84      // the worm
 #define WR_HEAD 0x9CF7C4        // its anterior, catching the light
 #define WR_FIRE 0xEAFFF2        // neurons, mid-flash
-#define WR_GLOBE 0x1E6B4C       // the graticule behind everything
+#define WR_GLOBE 0xC4CCD4       // the graticule: cool grey, deliberately not green
 
 typedef struct {
     // Two band buffers, alternated. The panel's DMA reads a band after
