@@ -26,6 +26,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "sync.h"
 #include "voice.h"
 #include "wormrender.h"
 #include "wormsim.h"
@@ -58,7 +59,20 @@ static wm_world *s_world;
 static wr_ctx s_ctx;
 static void *s_world_storage;
 static uint32_t s_generation;
-static char s_title[32], s_subtitle[64];
+
+// Set by the sync task when a newer generation lands. The worm task picks it up
+// at the next corpus rollover rather than mid-life: swapping a connectome out
+// from under a running animal would be a discontinuity you could see.
+static const double *volatile s_new_weights;
+static volatile uint32_t s_new_epoch;
+static const double *s_weights;  // what the current pass is running
+static char s_title[32], s_subtitle[64], s_flask[24];
+static uint32_t s_gen_number;
+
+static void on_new_genome(const double *weights, uint32_t epoch, void *ctx) {
+    s_new_epoch = epoch;
+    s_new_weights = weights;  // applied at the next rollover
+}
 static volatile uint32_t s_frames_total;
 // Where the worm task last was. The heartbeat prints it, so a hang says which
 // phase it hung in instead of just going quiet.
@@ -187,7 +201,15 @@ static void worm_task(void *arg) {
                 s_generation++;
                 ESP_LOGI(TAG, "corpus exhausted at tick %lld; beginning pass %lu",
                          (long long)s_world->tick_count, (unsigned long)s_generation + 1);
-                wm_world_init(s_world, &s_asset, s_asset.seed, s_world_storage);
+                // A downloaded genome takes effect here, at the generation
+                // boundary, which is where the server changes them too.
+                if (s_new_weights) {
+                    s_weights = s_new_weights;
+                    s_new_weights = NULL;
+                    ESP_LOGI(TAG, "running gen-%04lu", (unsigned long)s_new_epoch);
+                }
+                wm_world_init_weights(s_world, &s_asset, s_asset.seed,
+                                      s_world_storage, s_weights);
                 for (int k = 0; k < WARMUP_TICKS; k++) wm_world_tick(s_world);
                 wm_eaten drop[WM_EATEN_CAP];
                 wm_world_drain_eaten(s_world, drop, WM_EATEN_CAP);
@@ -354,10 +376,12 @@ void app_main(void) {
     wr_init(&s_ctx, scratch, s_band_rows, NULL);
 
     meta_field(s_asset.meta, "worm", s_title, sizeof(s_title));
-    char flask[24], gen[24];
-    meta_field(s_asset.meta, "flask", flask, sizeof(flask));
+    char gen[24];
+    meta_field(s_asset.meta, "flask", s_flask, sizeof(s_flask));
     meta_field(s_asset.meta, "gen", gen, sizeof(gen));
-    snprintf(s_subtitle, sizeof(s_subtitle), "%s  %s", flask, gen);
+    snprintf(s_subtitle, sizeof(s_subtitle), "%s  %s", s_flask, gen);
+    // "gen-0007" -> 7, so the sync knows where in the history this board is.
+    s_gen_number = (uint32_t)strtoul(gen[0] ? gen + 4 : "0", NULL, 10);
     s_ctx.title = s_title;
     s_ctx.subtitle = s_subtitle;
     s_ctx.title_alpha = 1.0f;
@@ -386,6 +410,19 @@ void app_main(void) {
     } else {
         ESP_LOGW(TAG, "no speaker; the worm will eat in silence");
     }
+
+    // Genome sync. Entirely optional: with no SSID configured this logs once
+    // and stops, and the worm never notices.
+    static sync_cfg_t sc;
+    snprintf(sc.ssid, sizeof(sc.ssid), "%s", CONFIG_WORM_WIFI_SSID);
+    snprintf(sc.pass, sizeof(sc.pass), "%s", CONFIG_WORM_WIFI_PASSWORD);
+    sc.flask = s_flask;
+    sc.worm = s_title;
+    sc.epoch = s_gen_number;
+    sc.poll_minutes = CONFIG_WORM_SYNC_MINUTES;
+    sc.asset = &s_asset;
+    sc.on_genome = on_new_genome;
+    sync_start(&sc);
 
     xTaskCreatePinnedToCore(worm_task, "worm", 8192, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(heartbeat_task, "beat", 3072, NULL, 2, NULL, 0);

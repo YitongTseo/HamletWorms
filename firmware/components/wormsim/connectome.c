@@ -15,6 +15,7 @@
 void wm_brain_init(wm_brain *b, const wm_asset *a, double *psyn_storage) {
     b->a = a;
     b->psyn = psyn_storage;
+    b->syn_w = a->syn_w;
     memset(b->psyn, 0, sizeof(double) * 2 * a->n_neurons);
     b->this_state = 0;
     b->next_state = 1;
@@ -28,7 +29,7 @@ void wm_brain_accumulate(wm_brain *b, uint32_t pre, double scale) {
     uint32_t s = a->row_start[pre], e = a->row_start[pre + 1];
     int ns = b->next_state;
     for (uint32_t i = s; i < e; i++)
-        PS(b, a->syn_col[i], ns) += a->syn_w[i] * scale;
+        PS(b, a->syn_col[i], ns) += b->syn_w[i] * scale;
 }
 
 static void fire_neuron(wm_brain *b, uint32_t n) {
@@ -81,4 +82,8 @@ void wm_brain_rand_excite(wm_brain *b, wm_rng *r, int k) {
     const wm_asset *a = b->a;
     for (int i = 0; i < k; i++)
         wm_brain_accumulate(b, a->presyn_idx[wm_rng_below(r, a->n_presyn)], 1.0);
+}
+
+void wm_brain_set_weights(wm_brain *b, const double *weights) {
+    b->syn_w = weights ? weights : b->a->syn_w;
 }

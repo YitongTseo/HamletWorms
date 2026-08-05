@@ -13,9 +13,11 @@ size_t wm_world_bytes(const wm_asset *a) {
          + sizeof(uint8_t) * n;       // chemo membership
 }
 
-void wm_world_init(wm_world *w, const wm_asset *a, uint32_t seed, void *storage) {
+void wm_world_init_weights(wm_world *w, const wm_asset *a, uint32_t seed,
+                           void *storage, const double *weights) {
     memset(w, 0, sizeof(*w));
     w->a = a;
+    w->pending_weights = weights;
 
     uint8_t *p = (uint8_t *)storage;
     size_t n = a->n_neurons;
@@ -29,6 +31,7 @@ void wm_world_init(wm_world *w, const wm_asset *a, uint32_t seed, void *storage)
     // 800 uniforms, and only then does rand_excite take its 40 choices.
     wm_rng_seed(&w->rng, seed);
     wm_brain_init(&w->brain, a, w->psyn_storage);
+    if (weights) wm_brain_set_weights(&w->brain, weights);
     wm_body_init(&w->body, WM_WORLD_W / 2.0, WM_WORLD_H / 2.0, &w->rng);
     wm_brain_rand_excite(&w->brain, &w->rng, 40);
 
@@ -196,6 +199,10 @@ int wm_world_drain_eaten(wm_world *w, wm_eaten *out, int cap) {
     memcpy(out, w->eaten, sizeof(wm_eaten) * (size_t)n);
     w->n_eaten = 0;
     return n;
+}
+
+void wm_world_init(wm_world *w, const wm_asset *a, uint32_t seed, void *storage) {
+    wm_world_init_weights(w, a, seed, storage, NULL);
 }
 
 void wm_world_poke(wm_world *w) {

@@ -1,0 +1,23 @@
+menu "HamletWorms"
+
+config WORM_WIFI_SSID
+    string "Wifi SSID"
+    default ""
+    help
+        Leave empty to run entirely offline. The worm is complete without a
+        network — this only lets it pick up newer generations as the server
+        evolves them.
+
+config WORM_WIFI_PASSWORD
+    string "Wifi password"
+    default ""
+
+config WORM_SYNC_MINUTES
+    int "Minutes between genome checks"
+    default 60
+    range 5 1440
+    help
+        A generation is a full pass of the play, about 6.9 hours, so there is
+        nothing to gain from checking often.
+
+endmenu

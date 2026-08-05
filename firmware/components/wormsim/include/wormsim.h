@@ -144,6 +144,12 @@ uint32_t wm_rng_below(wm_rng *r, uint32_t n);  // CPython _randbelow
 typedef struct {
     const wm_asset *a;
     double *psyn;  // [n_neurons][2], interleaved
+
+    // Synaptic weights in CSR edge order. Points at the baked table by default;
+    // wm_brain_set_weights swaps in a downloaded generation without disturbing
+    // the topology, which never changes.
+    const double *syn_w;
+
     int this_state, next_state;
     double accum_left, accum_right;
 } wm_brain;
@@ -152,6 +158,10 @@ void wm_brain_init(wm_brain *b, const wm_asset *a, double *psyn_storage);
 void wm_brain_accumulate(wm_brain *b, uint32_t pre, double scale);
 void wm_brain_run(wm_brain *b);
 void wm_brain_rand_excite(wm_brain *b, wm_rng *r, int k);
+
+// Swap the synaptic weights. Pass NULL to go back to the baked ones. The array
+// must have asset->n_edges entries in CSR order and outlive the brain.
+void wm_brain_set_weights(wm_brain *b, const double *weights);
 
 // ---------------------------------------------------------------------------
 // Body — worm-sim's trailing IK chain
@@ -239,6 +249,7 @@ typedef struct {
     wm_eaten eaten[WM_EATEN_CAP];
     int n_eaten;
 
+    const double *pending_weights;  // survives a rollover
     double *psyn_storage;
 
     // _chemo_pulse builds a plain dict and stimulate_weighted then iterates it.
@@ -254,6 +265,10 @@ typedef struct {
 // `storage` must hold wm_world_bytes(a) bytes and outlive the world.
 size_t wm_world_bytes(const wm_asset *a);
 void wm_world_init(wm_world *w, const wm_asset *a, uint32_t seed, void *storage);
+
+// Same, but starting from a downloaded weight set instead of the baked one.
+void wm_world_init_weights(wm_world *w, const wm_asset *a, uint32_t seed,
+                           void *storage, const double *weights);
 void wm_world_tick(wm_world *w);
 int wm_world_drain_eaten(wm_world *w, wm_eaten *out, int cap);
 
