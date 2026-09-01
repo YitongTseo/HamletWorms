@@ -11,6 +11,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+
+// Same microsecond source the firmware hands the renderer, so the per-stage
+// counters mean the same thing here as they do in the board's fps line.
+static uint32_t us_now(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint32_t)(tv.tv_sec * 1000000ull + tv.tv_usec);
+}
 
 // The board hands each band straight to the panel; here we reassemble a whole
 // frame so it can be written out as an image.
@@ -54,10 +63,11 @@ int main(int argc, char **argv) {
 
     uint16_t *fb = malloc(sizeof(uint16_t) * WR_W * WR_H);
     const int band_rows = 32;
-    uint8_t *globe = malloc(wr_globe_bytes());
-    wr_build_globe(globe);
+    wr_clock = us_now;
+    wr_build_globe();
     wr_ctx ctx;
-    wr_init(&ctx, malloc(wr_scratch_bytes(band_rows)), band_rows, globe);
+    wr_init(&ctx, malloc(wr_scratch_bytes(band_rows)), band_rows,
+            malloc(wr_bg_bytes()));
     ctx.view_units = view_units;
     ctx.title = "Liam";
     ctx.subtitle = "flask_1  gen-0007";
@@ -65,7 +75,12 @@ int main(int argc, char **argv) {
     float hold = 2.5f;
     ctx.invert = getenv("WR_INVERT") != NULL;   // preview the touch states
     ctx.xray = getenv("WR_XRAY") != NULL;
+    if (getenv("WR_SOLID")) ctx.stipple = 0.0f;      // the body without the screen
+    if (getenv("WR_NOBG")) ctx.bg_alien = false;     // and without the ball
+    if (getenv("WR_NOHAZE")) ctx.haze = 0.0f;
+    if (getenv("WR_NOANAT")) ctx.anatomy = false;
 
+    uint32_t t_draw = 0;
     for (int i = 0; i < n_frames; i++) {
         for (int t = 0; t < per_frame; t++) {
             wm_world_tick(w);
@@ -78,15 +93,37 @@ int main(int argc, char **argv) {
                 ctx.flash = 1.0f;
             }
         }
+        uint32_t td = us_now();
         wr_draw_banded(&ctx, w, collect_band, fb);
+        t_draw += us_now() - td;
+        if (getenv("WR_CAM")) {
+            // How fast does the camera actually move? Words drift up at a fixed
+            // 15 world units a second, but the camera rides the head, so what a
+            // word does on screen is that minus whatever the worm is doing.
+            static float pcx, pcy; static int have;
+            float s = (float)WR_W / ctx.view_units;
+            float ox = ((float)w->body.target_x - ctx.cam_x) * s;
+            float oy = ((float)w->body.target_y - ctx.cam_y) * s;
+            if (have)
+                printf("%d off %.1f %.1f cam %.1f %.1f  d/s %.1f %.1f px\n", i, ox, oy,
+                       ctx.cam_x, ctx.cam_y,
+                       (ctx.cam_x - pcx) * s * (float)WM_BODY_TICK_HZ / per_frame,
+                       (ctx.cam_y - pcy) * s * (float)WM_BODY_TICK_HZ / per_frame);
+            pcx = ctx.cam_x; pcy = ctx.cam_y; have = 1;
+        }
         // Same law as firmware/main/main.c, on this frame's simulated dt.
         float dt = (float)per_frame / (float)WM_BODY_TICK_HZ;
+        ctx.bg_time += dt;
         ctx.flash -= ctx.flash * dt * 3.2f;
         if (ctx.flash < 0.002f) ctx.flash = 0.0f;
         // Same hold-then-fade as firmware/main/main.c.
         hold -= dt;
         if (hold < 0.0f) ctx.title_alpha -= dt * 0.7f;
         if (ctx.title_alpha < 0.0f) ctx.title_alpha = 0.0f;
+
+        // "-" for the outdir renders without writing anything: the point is the
+        // clock, and a 650 KB PPM per frame swamps it.
+        if (outdir[0] == '-' && !outdir[1]) continue;
 
         char name[512];
         snprintf(name, sizeof(name), "%s/frame_%04d.ppm", outdir, i);
@@ -106,5 +143,10 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "wrote %d frames to %s (tick %lld, view %.0f world units)\n",
             n_frames, outdir, (long long)w->tick_count, view_units);
+    fprintf(stderr, "draw %.3f ms/frame\n", t_draw / 1000.0 / n_frames);
+    fprintf(stderr, "per frame: ball %.2f  bg %.2f  frame %.2f  words %.2f  worm %.2f ms\n",
+            wr_us_sphere / 1000.0 / n_frames,
+            wr_us_bg / 1000.0 / n_frames, wr_us_frame / 1000.0 / n_frames,
+            wr_us_words / 1000.0 / n_frames, wr_us_worm / 1000.0 / n_frames);
     return 0;
 }

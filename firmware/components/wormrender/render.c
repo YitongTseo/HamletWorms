@@ -13,7 +13,14 @@
 // made in wormsim, whose determinism depends on float64 — but nothing in here
 // feeds the simulation.
 //
-// Draw order, back to front: globe graticule, words, worm, flash.
+// Draw order, back to front: the alien sphere and the word haze (one coarse
+// field, resampled up), the globe graticule, the words, the stippled worm, the
+// flash.
+//
+// Two things are computed on a 64x64 grid rather than per pixel — the sphere and
+// the clouds behind the words — because both are genuinely low-frequency. That
+// turns a full-screen shader into 4096 evaluations plus a resample, which is the
+// only reason any of this fits in the frame budget.
 
 #include "wormrender.h"
 
@@ -22,7 +29,7 @@
 #include <string.h>
 
 // Per-stage microseconds, for tuning. Costs nothing while wr_clock is NULL.
-uint32_t wr_us_frame, wr_us_words, wr_us_worm;
+uint32_t wr_us_sphere, wr_us_bg, wr_us_frame, wr_us_words, wr_us_worm;
 uint32_t (*wr_clock)(void);
 #define WR_T() (wr_clock ? wr_clock() : 0u)
 
@@ -30,6 +37,9 @@ uint32_t (*wr_clock)(void);
 // camera frames the whole 800-unit body. Here the window is 400 units, so 22
 // reads as a snake. 15 keeps the nematode slenderness at this magnification.
 #define WR_DEFAULT_RADIUS 15.0f
+
+// How far the head may get from the middle of the panel, px.
+#define WR_CAM_LEASH 105.0f
 
 size_t wr_scratch_bytes(int band_rows) {
     // two band buffers (RGB565) + coverage byte + body-position byte
@@ -67,7 +77,11 @@ static inline uint32_t lerp_rgb(uint32_t a, uint32_t b, uint32_t m) {
            (((a & 0xFF) * ia + (b & 0xFF) * m) / 255);
 }
 
-void wr_init(wr_ctx *c, uint8_t *scratch, int band_rows, const uint8_t *globe) {
+static void build_stipple(void);
+static void build_bg_tables(void);
+static void bg_attach(uint8_t *mem);
+
+void wr_init(wr_ctx *c, uint8_t *scratch, int band_rows, uint8_t *bg) {
     memset(c, 0, sizeof(*c));
     c->band_rows = band_rows;
     c->band_mem = (uint16_t *)scratch;
@@ -75,13 +89,23 @@ void wr_init(wr_ctx *c, uint8_t *scratch, int band_rows, const uint8_t *globe) {
     c->band_parity = 0;
     c->cov = scratch + (size_t)WR_W * band_rows * 4;
     c->seg = c->cov + (size_t)WR_W * band_rows;
-    c->globe = globe;
+    bg_attach(bg);
 
     // 400 world units across = 2 x FOOD_SENSE_RADIUS, so the rim of the round
     // display sits exactly on the edge of what the worm can smell.
     c->view_units = 400.0f;
     c->body_radius = WR_DEFAULT_RADIUS;
     c->round_mask = true;
+    // The graticule is set dressing now rather than the background itself.
+    c->globe_alpha = 0.22f;
+    c->bg_alien = true;
+    c->haze = 1.0f;
+    c->stipple = 1.0f;
+    c->cam_lag = 2.5f;
+    c->anatomy = true;
+
+    build_stipple();
+    build_bg_tables();
 }
 
 static inline float scale_of(const wr_ctx *c) { return (float)WR_W / c->view_units; }
@@ -92,6 +116,379 @@ static inline void w2s(const wr_ctx *c, float wx, float wy, float *sx, float *sy
     float s = scale_of(c);
     *sx = (wx - c->cam_x) * s + WR_W / 2.0f;
     *sy = (wy - c->cam_y) * s + WR_H / 2.0f;
+}
+
+// --- the background -----------------------------------------------------------
+//
+// An orthographic ball with three-dimensional value noise on its surface, the
+// noise's own domain warped by a coarser octave of itself so the pattern folds
+// inward as the ball turns. It is the one thing on the panel that is neither the
+// animal nor the play, and it is kept dark on purpose: on an AMOLED the black
+// around it is off, and a background bright enough to light the whole panel
+// would throw away the depth that buys.
+//
+// It is evaluated on a WR_BG_N x WR_BG_N grid — 4096 samples instead of 217156 —
+// and bilinearly resampled on the way to the panel. Nothing in it has detail
+// finer than seven pixels, so nothing is lost, and the same field carries the
+// haze the words sit in.
+
+// Radius of the ball as a fraction of the half-screen. Slightly over 1 so its
+// limb sits just outside the round panel and the darkness at the edge is the
+// sphere's own falloff rather than a visible horizon.
+#define WR_BG_SPHERE 1.06f
+#define WR_BG_GAIN 0.44f  // ceiling on the sphere's brightness
+#define WR_HAZE_CORE 1.42f  // 1/(1 - the fraction of the ellipse that stays flat)
+#define WR_HAZE_MAX 186.0f  // how white a word's cloud gets over the word itself
+#define WR_DUST_THRESH 16  // stipple threshold below which a background dot lights
+#define WR_DUST_ALPHA 40
+
+// Recomputing the noise every third frame. The ball turns at 0.11 rad/s and the
+// field is a 7 px-per-cell blur; at 12-20 fps there is nothing in it that moves
+// far enough in three frames to see. The haze is refreshed every frame
+// regardless — that one tracks the words.
+#define WR_BG_NOISE_EVERY 3
+
+#define WR_BG_BYTES ((size_t)WR_BG_N * WR_BG_N * 3)
+
+static uint8_t *bg_noise;  // the ball alone
+static uint8_t *bg_field;  // the ball plus this frame's haze
+static uint32_t bg_noise_frame = 0xFFFFFFFFu;
+
+size_t wr_bg_bytes(void) { return WR_BG_BYTES * 2; }
+
+static void bg_attach(uint8_t *mem) {
+    bg_noise = mem;
+    bg_field = mem + WR_BG_BYTES;
+}
+
+// Everything in the field dies before the bezel, so neither the ball nor a
+// word's cloud gets sliced off square by the round mask. Computed rather than
+// tabulated: it is a handful of operations and the table was 4 KB.
+static inline float bg_rim_at(int i, int j) {
+    float u = ((float)i + 0.5f) / WR_BG_N * 2.0f - 1.0f;
+    float v = ((float)j + 0.5f) / WR_BG_N * 2.0f - 1.0f;
+    float k = (1.02f - sqrtf(u * u + v * v)) * 5.0f;
+    if (k < 0.0f) k = 0.0f;
+    if (k > 1.0f) k = 1.0f;
+    return k * k * (3.0f - 2.0f * k);
+}
+
+// Resample tables: for each output pixel, which pair of cells it lies between
+// and how far along. Built once — the mapping is fixed by the geometry.
+static uint16_t bg_ix[WR_W], bg_iy[WR_H];
+static uint8_t bg_fx[WR_W], bg_fy[WR_H];
+
+// Two horizontally-resampled rows, held across the bands of a frame, already in
+// the panel's own RGB565. Output rows arrive in order, so a source row is
+// expanded once and then reused by the seven or so output rows inside it — and
+// the remaining per-pixel work is one blend between two packed pixels, which is
+// four multiplies rather than three lerps and a pack.
+//
+// Interpolating in 565 rather than in 8-bit costs nothing real: the panel is
+// 565, so both paths land on the same set of colours.
+static uint16_t bg_rowbuf[2][WR_W];
+static uint16_t *bg_rowA = bg_rowbuf[0], *bg_rowB = bg_rowbuf[1];
+static int bg_row_have = -1;  // source row currently in bg_rowA
+
+// One 32-bit mix. Not a good hash in any cryptographic sense; it only has to
+// decorrelate three small integers, and it has to be cheap, because the noise
+// asks for eight of them per octave.
+static inline uint32_t hashi(int32_t x, int32_t y, int32_t z) {
+    uint32_t h = (uint32_t)x * 0x1F123BB5u ^ (uint32_t)y * 0x85EBCA6Bu ^
+                 (uint32_t)z * 0xC2B2AE35u;
+    h ^= h >> 15;
+    h *= 0x2C1B3C6Du;
+    h ^= h >> 13;
+    return h;
+}
+
+static inline float hashf(int32_t x, int32_t y, int32_t z) {
+    return (float)(hashi(x, y, z) >> 9) * (1.0f / 8388608.0f);
+}
+
+static float vnoise3(float x, float y, float z) {
+    float fx = floorf(x), fy = floorf(y), fz = floorf(z);
+    int ix = (int)fx, iy = (int)fy, iz = (int)fz;
+    float tx = x - fx, ty = y - fy, tz = z - fz;
+    // Smoothstep the interpolants, not the values: trilinear alone leaves the
+    // cell lattice visible as creases, which on a slowly turning ball reads as a
+    // wireframe rather than as matter.
+    tx = tx * tx * (3.0f - 2.0f * tx);
+    ty = ty * ty * (3.0f - 2.0f * ty);
+    tz = tz * tz * (3.0f - 2.0f * tz);
+
+    float c000 = hashf(ix, iy, iz), c100 = hashf(ix + 1, iy, iz);
+    float c010 = hashf(ix, iy + 1, iz), c110 = hashf(ix + 1, iy + 1, iz);
+    float c001 = hashf(ix, iy, iz + 1), c101 = hashf(ix + 1, iy, iz + 1);
+    float c011 = hashf(ix, iy + 1, iz + 1), c111 = hashf(ix + 1, iy + 1, iz + 1);
+
+    float x00 = c000 + (c100 - c000) * tx, x10 = c010 + (c110 - c010) * tx;
+    float x01 = c001 + (c101 - c001) * tx, x11 = c011 + (c111 - c011) * tx;
+    float y0 = x00 + (x10 - x00) * ty, y1 = x01 + (x11 - x01) * ty;
+    return y0 + (y1 - y0) * tz;
+}
+
+static float fbm3(float x, float y, float z, int octaves) {
+    float sum = 0.0f, amp = 0.5f, norm = 0.0f;
+    for (int i = 0; i < octaves; i++) {
+        sum += amp * vnoise3(x, y, z);
+        norm += amp;
+        amp *= 0.5f;
+        x *= 2.03f;  // not exactly 2: an integer lacunarity lines the octaves'
+        y *= 2.03f;  // lattices up and the creases come back
+        z *= 2.03f;
+    }
+    return sum / norm;
+}
+
+static void build_bg_tables(void) {
+    for (int x = 0; x < WR_W; x++) {
+        float u = ((float)x + 0.5f) * (float)WR_BG_N / (float)WR_W - 0.5f;
+        int i = (int)floorf(u);
+        float f = u - (float)i;
+        if (i < 0) { i = 0; f = 0.0f; }
+        if (i > WR_BG_N - 2) { i = WR_BG_N - 2; f = 1.0f; }
+        bg_ix[x] = (uint16_t)i;
+        bg_fx[x] = (uint8_t)(f * 255.0f + 0.5f);
+    }
+    for (int y = 0; y < WR_H; y++) {
+        float v = ((float)y + 0.5f) * (float)WR_BG_N / (float)WR_H - 0.5f;
+        int j = (int)floorf(v);
+        float f = v - (float)j;
+        if (j < 0) { j = 0; f = 0.0f; }
+        if (j > WR_BG_N - 2) { j = WR_BG_N - 2; f = 1.0f; }
+        bg_iy[y] = (uint16_t)j;
+        bg_fy[y] = (uint8_t)(f * 255.0f + 0.5f);
+    }
+    bg_row_have = -1;
+    bg_noise_frame = 0xFFFFFFFFu;
+}
+
+static void build_bg_noise(float t) {
+    // The ball turns about an axis that is itself tilted, so no feature ever
+    // traces the same path twice and the poles stay off the silhouette.
+    const float ca = cosf(t * 0.11f), sa = sinf(t * 0.11f);
+    const float ct = cosf(0.42f), st = sinf(0.42f);
+    // A fixed key light, high and to the left, so the thing reads as a solid
+    // rather than as a disc of texture.
+    const float lx = -0.42f, ly = -0.52f, lz = 0.74f;
+
+    for (int j = 0; j < WR_BG_N; j++) {
+        for (int i = 0; i < WR_BG_N; i++) {
+            uint8_t *o = &bg_noise[((size_t)j * WR_BG_N + i) * 3];
+            float u = (((float)i + 0.5f) / WR_BG_N * 2.0f - 1.0f) / WR_BG_SPHERE;
+            float v = (((float)j + 0.5f) / WR_BG_N * 2.0f - 1.0f) / WR_BG_SPHERE;
+            float r2 = u * u + v * v;
+            if (r2 >= 1.0f) { o[0] = o[1] = o[2] = 0; continue; }
+            float z = sqrtf(1.0f - r2);
+
+            float px = u * ca + z * sa, pz = -u * sa + z * ca, py = v;
+            float qy = py * ct - pz * st, qz = py * st + pz * ct;
+
+            // Domain warp: a coarse field displacing a finer one. This is what
+            // makes it fold rather than merely drift — the fine pattern is being
+            // dragged through itself.
+            float wv = fbm3(px * 1.5f, qy * 1.5f, qz * 1.5f + t * 0.07f, 2);
+            float n = fbm3(px * 4.3f + wv * 3.4f, qy * 4.3f + wv * 3.4f,
+                           qz * 4.3f - t * 0.05f, 3);
+
+            // Ridged: fold the field about its midpoint so the level set becomes
+            // a crest instead of a plateau. Plain fbm on a sphere reads as
+            // smoke; the ridges read as something with structure inside it,
+            // which is the whole point of putting it there.
+            float sh = 1.0f - fabsf(n * 2.0f - 1.0f);
+            sh = sh * sh;
+            // Then push the midtones down: only the crests glow, and the rest
+            // stays close enough to black that the panel's own black still reads
+            // as depth.
+            sh = sh * 1.55f - 0.42f;
+            if (sh < 0.0f) sh = 0.0f;
+            if (sh > 1.0f) sh = 1.0f;
+
+            float lam = u * lx + v * ly + z * lz;
+            if (lam < 0.0f) lam = 0.0f;
+            float lit = (0.18f + 0.82f * lam) * WR_BG_GAIN;
+
+            uint32_t col = sh < 0.5f
+                ? lerp_rgb(WR_BG_LOW, WR_BG_MID, (uint32_t)(sh * 510.0f))
+                : lerp_rgb(WR_BG_MID, WR_BG_HIGH, (uint32_t)((sh - 0.5f) * 510.0f));
+
+            // A cold fresnel at the limb. Cheap sphere-ness: the eye reads a
+            // bright edge on a dark disc as curvature without being told.
+            float fr = 1.0f - z;
+            fr = fr * fr * fr * fr;
+
+            float rr = (float)((col >> 16) & 0xFF) * lit + ((WR_BG_RIM >> 16) & 0xFF) * fr;
+            float gg = (float)((col >> 8) & 0xFF) * lit + ((WR_BG_RIM >> 8) & 0xFF) * fr;
+            float bb = (float)(col & 0xFF) * lit + (WR_BG_RIM & 0xFF) * fr;
+
+            float k = bg_rim_at(i, j);
+            uint32_t ir = (uint32_t)(rr * k), ig = (uint32_t)(gg * k),
+                     ib = (uint32_t)(bb * k);
+            o[0] = (uint8_t)(ir > 255 ? 255 : ir);
+            o[1] = (uint8_t)(ig > 255 ? 255 : ig);
+            o[2] = (uint8_t)(ib > 255 ? 255 : ib);
+        }
+    }
+}
+
+static void bg_expand_row(int src, uint16_t *out) {
+    const uint8_t *row = &bg_field[(size_t)src * WR_BG_N * 3];
+    for (int x = 0; x < WR_W; x++) {
+        const uint8_t *a = row + (size_t)bg_ix[x] * 3;
+        int f = bg_fx[x];
+        uint32_t r = (uint32_t)(a[0] + (((int)a[3] - (int)a[0]) * f >> 8));
+        uint32_t g = (uint32_t)(a[1] + (((int)a[4] - (int)a[1]) * f >> 8));
+        uint32_t b = (uint32_t)(a[2] + (((int)a[5] - (int)a[2]) * f >> 8));
+        out[x] = (uint16_t)((r >> 3) << 11 | (g >> 2) << 5 | (b >> 3));
+    }
+}
+
+// Fill a band from the coarse field, and sprinkle the background dot lattice
+// while every pixel is already in hand. The dust is the same stipple screen the
+// worm is drawn through, at its lowest threshold — one pixel per dot cell — so
+// the animal reads as those dots thickening rather than as a separate object
+// laid over them.
+static uint8_t stipple[WR_STIPPLE_TILE * WR_STIPPLE_TILE];
+static uint8_t stip_gain[256];  // how bright a dot is, by the coverage under it
+static uint8_t stip_veil[256];  // and how far the ground under it is pushed down
+static uint8_t dust_x[WR_STIPPLE_TILE][12];  // where the background dots fall
+static uint8_t dust_n[WR_STIPPLE_TILE];
+
+static void band_bg(wr_ctx *c, int y0, int h) {
+    // A fifth of every band is corner that the round mask will throw away, and
+    // this is the costliest per-pixel loop in the renderer. Skip it here; the
+    // mask still runs at the end, because the worm and the graticule can reach
+    // out there afterwards.
+    const float mcx = WR_W / 2.0f, mcy = WR_H / 2.0f, mr = WR_W / 2.0f - 0.5f;
+    for (int y = 0; y < h; y++) {
+        int sy = y0 + y;
+        int r0 = bg_iy[sy];
+        if (r0 != bg_row_have) {
+            if (r0 == bg_row_have + 1) {
+                uint16_t *t = bg_rowA;
+                bg_rowA = bg_rowB;
+                bg_rowB = t;
+                bg_expand_row(r0 + 1, bg_rowB);
+            } else {
+                bg_expand_row(r0, bg_rowA);
+                bg_expand_row(r0 + 1, bg_rowB);
+            }
+            bg_row_have = r0;
+        }
+        uint32_t t = bg_fy[sy] >> 3, it = 32 - t;  // 5 bits is all 565 can use
+        const uint16_t *A = bg_rowA, *B = bg_rowB;
+        uint16_t *dst = c->band + (size_t)y * WR_W;
+
+        float dy = (float)sy + 0.5f - mcy;
+        float q = mr * mr - dy * dy;
+        if (q <= 0.0f) {
+            memset(dst, 0, sizeof(uint16_t) * WR_W);
+            continue;
+        }
+        float hx = sqrtf(q);
+        int x0 = (int)(mcx - hx), x1 = (int)(mcx + hx);
+        if (x0 < 0) x0 = 0;
+        if (x1 >= WR_W) x1 = WR_W - 1;
+        memset(dst, 0, sizeof(uint16_t) * (size_t)x0);
+        memset(dst + x1 + 1, 0, sizeof(uint16_t) * (size_t)(WR_W - 1 - x1));
+
+        for (int x = x0; x <= x1; x++) {
+            uint32_t a = A[x], b = B[x];
+            uint32_t rb = ((a & 0xF81Fu) * it + (b & 0xF81Fu) * t) >> 5;
+            uint32_t g = ((a & 0x07E0u) * it + (b & 0x07E0u) * t) >> 5;
+            dst[x] = (uint16_t)((rb & 0xF81Fu) | (g & 0x07E0u));
+        }
+
+        // The dust, from a list rather than a test. Its positions are fixed by
+        // the stipple screen, so the pixels that light are known ahead of time —
+        // about fourteen a row, against 466 comparisons if it were a per-pixel
+        // branch inside the loop above.
+        const uint8_t *dx = dust_x[sy & (WR_STIPPLE_TILE - 1)];
+        int dn = dust_n[sy & (WR_STIPPLE_TILE - 1)];
+        for (int base = 0; base < WR_W; base += WR_STIPPLE_TILE)
+            for (int k = 0; k < dn; k++) {
+                int x = base + dx[k];
+                if (x < x0 || x > x1) continue;
+                blend(dst + x, WR_DUST, WR_DUST_ALPHA);
+            }
+    }
+}
+
+// --- the stipple screen -------------------------------------------------------
+//
+// A clustered-dot threshold field on a jittered lattice, tiled across the panel
+// and fixed to it. A pixel lights when the body's coverage there exceeds its
+// threshold, and the threshold rises as the square of the distance to the
+// nearest dot centre — so a dot's area is linear in coverage and the animal
+// arriving underneath makes the dots swell rather than makes new ones appear.
+//
+// Screen-fixed, not body-fixed: the lattice does not move, so the worm reads as
+// something passing under a fabric rather than as something wearing a texture.
+
+#define WR_STIPPLE_CELLS 11  // dot centres per tile edge: 64/11 = 5.8 px apart
+#define WR_STIPPLE_R 0.50f   // max dot radius, in lattice spacings
+#define WR_STIPPLE_GAIN 242  // of 256: the ceiling that keeps the interstices open
+#define WR_STIPPLE_EDGE 5    // how hard a dot's own edge is
+#define WR_BODY_BANDS 0.0f   // amplitude of the old brightness wave; 0.14 restores it
+#define WR_BODY_VEIL 0.72f   // how far the ground under the animal is pushed down
+
+static void build_stipple(void) {
+    const int C = WR_STIPPLE_CELLS, T = WR_STIPPLE_TILE;
+    const float pitch = (float)T / (float)C;
+    const float rmax = pitch * WR_STIPPLE_R;
+    static float cx[WR_STIPPLE_CELLS * WR_STIPPLE_CELLS];
+    static float cy[WR_STIPPLE_CELLS * WR_STIPPLE_CELLS];
+    static float cr[WR_STIPPLE_CELLS * WR_STIPPLE_CELLS];
+
+    for (int j = 0; j < C; j++) {
+        for (int i = 0; i < C; i++) {
+            uint32_t hh = hashi(i, j, 17);
+            // Half-offset odd rows for a hex-ish packing, then jitter, so the
+            // screen does not read as the square grid it is built on.
+            float ox = (j & 1) ? 0.5f : 0.0f;
+            cx[j * C + i] = ((float)i + 0.5f + ox + ((float)(hh & 255) / 255.0f - 0.5f) * 0.30f) * pitch;
+            cy[j * C + i] = ((float)j + 0.5f + ((float)((hh >> 8) & 255) / 255.0f - 0.5f) * 0.30f) * pitch;
+            cr[j * C + i] = rmax * (0.86f + 0.30f * (float)((hh >> 16) & 255) / 255.0f);
+        }
+    }
+
+    for (int y = 0; y < T; y++) {
+        for (int x = 0; x < T; x++) {
+            float best = 1.0f;
+            for (int k = 0; k < C * C; k++) {
+                float dx = fabsf((float)x + 0.5f - cx[k]);
+                float dy = fabsf((float)y + 0.5f - cy[k]);
+                if (dx > T * 0.5f) dx = (float)T - dx;  // the tile wraps
+                if (dy > T * 0.5f) dy = (float)T - dy;
+                float d2 = dx * dx + dy * dy;
+                float q = d2 / (cr[k] * cr[k]);
+                if (q < best) best = q;
+            }
+            stipple[y * T + x] = (uint8_t)(best * 255.0f);
+        }
+    }
+
+    for (int y = 0; y < T; y++) {
+        int n = 0;
+        for (int x = 0; x < T && n < (int)sizeof(dust_x[0]); x++)
+            if (stipple[y * T + x] < WR_DUST_THRESH) dust_x[y][n++] = (uint8_t)x;
+        dust_n[y] = (uint8_t)n;
+    }
+
+    for (int i = 0; i < 256; i++) {
+        float t = (float)i / 240.0f;
+        if (t > 1.0f) t = 1.0f;
+        stip_gain[i] = (uint8_t)(70.0f + 185.0f * t * t);
+        // The animal darkens what it passes over, in 32nds. Without this the
+        // green dots land on a white word-cloud at nearly the same value as the
+        // black type beside them and the two read as one texture; with it the
+        // worm always has its own dark ground and sits unmistakably in front.
+        // The words stay legible through it, which is the point — it is a
+        // shadow, not an eraser.
+        float v = (float)i / 255.0f;
+        stip_veil[i] = (uint8_t)(32.0f - 32.0f * WR_BODY_VEIL * v * v);
+    }
 }
 
 // --- the frame ---------------------------------------------------------------
@@ -130,10 +527,7 @@ typedef struct {
 static wr_frame_pt wr_frame[WR_FRAME_MAX_PTS];
 static int wr_frame_n;
 
-size_t wr_globe_bytes(void) { return 0; }  // no mask any more
-
-void wr_build_globe(uint8_t *unused) {
-    (void)unused;
+void wr_build_globe(void) {
     const float ct = cosf(WR_FRAME_TILT), st = sinf(WR_FRAME_TILT);
     // Undo the foreshortening the tilt introduces, so the poles still land
     // exactly on SPAWN_Y and KILL_Y.
@@ -272,13 +666,74 @@ static float text_width_t(const char *s, int len, float tracking) {
 }
 
 
+// Depth. A word does not switch on when it crosses the rim and off when it
+// leaves; it arrives, the way something entering the edge of your attention
+// does. Over the bottom two fifths of the panel it grows from a bit over half
+// size and fades up, holds through the middle, then over the top third fades out
+// and draws back down again — which reads as passing overhead rather than as
+// being deleted.
+//
+// The distances are large on purpose. Words climb at 15 world units a second,
+// about 17 px, so the arrival takes some thirteen seconds and the departure ten.
+#define WR_FADE_IN_BOT 1.05f   // fraction of panel height where a word starts to exist
+#define WR_FADE_IN_TOP 0.55f   // and where it is fully here
+#define WR_FADE_OUT_TOP (-0.05f)  // where it has finished leaving
+#define WR_FADE_OUT_BOT 0.38f  // and where leaving begins
+#define WR_SCALE_MIN 0.54f     // its size the moment it appears at the bottom
+#define WR_SCALE_OUT 0.86f     // and the size it has shrunk to as it goes
+
+// The panel is a circle, so the vertical profile alone is not enough: a word
+// off to one side crosses the bezel on an arc, not through the bottom, and used
+// to switch on the moment it cleared the mask. This is the arrival that actually
+// does most of the work — full weight inside 60% of the radius, nothing at the
+// bezel, which is 103 px of travel and about four seconds at the speed the
+// camera moves. It is also the peripheral-vision reading the framing already
+// claims: what is off to the side is hazy, what is in the middle is sharp.
+#define WR_FADE_RIM 1.06f
+#define WR_FADE_CORE 0.60f
+
+// A shadow needs something to fall on, which is what the haze is for. Offset
+// down and right from a light that is up and left — the same one lighting the
+// ball behind it. It is violet-grey rather than black, because the word itself
+// is nearly black now: a black shadow under black type is just a heavier letter,
+// and what should read is the sliver of it that falls past the stroke onto the
+// cloud.
+#define WR_SHADOW_DX 3.0f
+#define WR_SHADOW_DY 4.0f
+#define WR_SHADOW_A 0.55f
+
+static inline float smoothstep_e(float e0, float e1, float x) {
+    float t = (x - e0) / (e1 - e0);
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// How much of a glyph survives right at the bezel. The word as a whole has
+// already been faded by its distance from the middle; this is only here so that
+// the far end of a long word does not get cut off square by the round mask.
+static inline float rim_fade(float x, float y) {
+    float dx = x - WR_W * 0.5f, dy = y - WR_H * 0.5f;
+    float r = sqrtf(dx * dx + dy * dy) / (WR_W * 0.5f);
+    return smoothstep_e(1.06f, 0.94f, r);
+}
+
 // Centred on (cx, cy), matching the site's textAlign/textBaseline centre in
 // viewer/focus/text-canvas.js. Rows outside the band are skipped.
-static void draw_text_t(wr_ctx *c, int y0, int h, const char *s, int len,
+//
+// `scale` under 1 resamples the atlas bilinearly rather than picking a smaller
+// baked size: the growth has to be continuous, and a word stepping between two
+// baked sizes changes width by several pixels at once, which is visible as a
+// twitch even under a fade. Full size takes the straight blit — that is where
+// the words spend most of their life.
+static void draw_glyphs(wr_ctx *c, int y0, int h, const char *s, int len,
                         float cx, float cy, uint32_t color, uint32_t alpha,
-                        float tracking) {
-    float pen = cx - text_width_t(s, len, tracking) / 2.0f;
-    float base = cy + wr_font_size * 0.36f;  // optical centre, not the baseline
+                        float tracking, float scale, bool rim) {
+    if (alpha == 0) return;
+    const bool exact = scale > 0.995f;
+    float pen = cx - text_width_t(s, len, tracking) * scale / 2.0f;
+    float base = cy + wr_font_size * 0.36f * scale;
+    const float inv = 1.0f / scale;
 
     for (int i = 0; i < len;) {
         int used, gi = glyph_slot(s + i, len - i, &used);
@@ -286,63 +741,221 @@ static void draw_text_t(wr_ctx *c, int y0, int h, const char *s, int len,
         if (gi < 0) continue;
         const wr_glyph *g = &wr_font_glyph[gi];
         if (g->w) {
-            int gx0 = (int)lroundf(pen + g->bx);
-            int gy0 = (int)lroundf(base + g->by);
-            for (int gy = 0; gy < g->h; gy++) {
-                int py = gy0 + gy - y0;
-                if (py < 0 || py >= h) continue;
-                const uint8_t *row =
-                    wr_font_atlas + (size_t)(g->ay + gy) * wr_font_atlas_w + g->ax;
-                uint16_t *dst = c->band + (size_t)py * WR_W;
-                for (int gx = 0; gx < g->w; gx++) {
-                    int px = gx0 + gx;
-                    if (px < 0 || px >= WR_W) continue;
-                    blend(dst + px, color, ((uint32_t)row[gx] * alpha * 257) >> 16);
+            int dw = exact ? g->w : (int)(g->w * scale + 0.5f);
+            int dh = exact ? g->h : (int)(g->h * scale + 0.5f);
+            if (dw < 1) dw = 1;
+            if (dh < 1) dh = 1;
+            int gx0 = (int)lroundf(pen + g->bx * scale);
+            int gy0 = (int)lroundf(base + g->by * scale);
+
+            uint32_t ga = alpha;
+            if (rim) {
+                float f = rim_fade((float)gx0 + dw * 0.5f, (float)gy0 + dh * 0.5f);
+                ga = (uint32_t)(alpha * f);
+                if (ga == 0) { pen += (g->adv + tracking) * scale; continue; }
+            }
+
+            if (exact) {
+                for (int gy = 0; gy < g->h; gy++) {
+                    int py = gy0 + gy - y0;
+                    if (py < 0 || py >= h) continue;
+                    const uint8_t *row =
+                        wr_font_atlas + (size_t)(g->ay + gy) * wr_font_atlas_w + g->ax;
+                    uint16_t *dst = c->band + (size_t)py * WR_W;
+                    for (int gx = 0; gx < g->w; gx++) {
+                        int px = gx0 + gx;
+                        if (px < 0 || px >= WR_W) continue;
+                        blend(dst + px, color, ((uint32_t)row[gx] * ga * 257) >> 16);
+                    }
+                }
+            } else {
+                for (int dy = 0; dy < dh; dy++) {
+                    int py = gy0 + dy - y0;
+                    if (py < 0 || py >= h) continue;
+                    float fy = ((float)dy + 0.5f) * inv - 0.5f;
+                    int sy0 = (int)floorf(fy);
+                    uint32_t wy = (uint32_t)((fy - (float)sy0) * 256.0f);
+                    if (sy0 < 0) { sy0 = 0; wy = 0; }
+                    int sy1 = sy0 + 1;
+                    if (sy1 > g->h - 1) { sy1 = g->h - 1; }
+                    if (sy0 > g->h - 1) { sy0 = g->h - 1; wy = 0; }
+                    const uint8_t *r0 =
+                        wr_font_atlas + (size_t)(g->ay + sy0) * wr_font_atlas_w + g->ax;
+                    const uint8_t *r1 =
+                        wr_font_atlas + (size_t)(g->ay + sy1) * wr_font_atlas_w + g->ax;
+                    uint16_t *dst = c->band + (size_t)py * WR_W;
+                    for (int dx = 0; dx < dw; dx++) {
+                        int px = gx0 + dx;
+                        if (px < 0 || px >= WR_W) continue;
+                        float fx = ((float)dx + 0.5f) * inv - 0.5f;
+                        int sx0 = (int)floorf(fx);
+                        uint32_t wx = (uint32_t)((fx - (float)sx0) * 256.0f);
+                        if (sx0 < 0) { sx0 = 0; wx = 0; }
+                        int sx1 = sx0 + 1;
+                        if (sx1 > g->w - 1) sx1 = g->w - 1;
+                        if (sx0 > g->w - 1) { sx0 = g->w - 1; wx = 0; }
+                        uint32_t t0 = r0[sx0] * (256 - wx) + r0[sx1] * wx;
+                        uint32_t t1 = r1[sx0] * (256 - wx) + r1[sx1] * wx;
+                        uint32_t a = ((t0 * (256 - wy) + t1 * wy) >> 16);
+                        blend(dst + px, color, (a * ga * 257) >> 16);
+                    }
                 }
             }
         }
-        pen += g->adv + tracking;
+        pen += (g->adv + tracking) * scale;
     }
 }
 
-static void draw_text(wr_ctx *c, int y0, int h, const char *s, int len,
-                      float cx, float cy, uint32_t color, uint32_t alpha) {
-    draw_text_t(c, y0, h, s, len, cx, cy, color, alpha, 0.0f);
+static void draw_text_t(wr_ctx *c, int y0, int h, const char *s, int len,
+                        float cx, float cy, uint32_t color, uint32_t alpha,
+                        float tracking) {
+    draw_glyphs(c, y0, h, s, len, cx, cy, color, alpha, tracking, 1.0f, false);
 }
 
-static void band_words(wr_ctx *c, const wm_world *w, int y0, int h) {
+// The frame's visible words, resolved once in the prologue: screen position,
+// depth, colour. Fifteen bands each re-deriving this per word was fifteen times
+// the fade arithmetic and fifteen times the string lookup for one answer, and
+// the haze pass needs the same list before any band is drawn.
+typedef struct {
+    const char *txt;
+    uint16_t len;
+    float sx, sy, scale;
+    uint32_t rgb;
+    uint16_t alpha;
+    uint8_t lit;  // an edible word: carries a cloud and casts a shadow
+} wr_wordv;
+
+#define WR_MAX_VIS_WORDS 224
+static wr_wordv wv[WR_MAX_VIS_WORDS];
+static int wv_n;
+
+static void build_words(wr_ctx *c, const wm_world *w) {
     const wm_asset *a = w->a;
     const wm_scroller *sc = &w->scroller;
-    const float margin = 60.0f;
+    // Half the widest word in the corpus at this size, so a word is only
+    // dropped once no part of it could reach the panel.
+    const float margin = 160.0f;
+    wv_n = 0;
 
-    for (int li = 0; li < sc->n_lines; li++) {
+    for (int li = 0; li < sc->n_lines && wv_n < WR_MAX_VIS_WORDS; li++) {
         const wm_line *L = &sc->lines[li];
-        for (uint16_t wi = 0; wi < L->n_words; wi++) {
+        for (uint16_t wi = 0; wi < L->n_words && wv_n < WR_MAX_VIS_WORDS; wi++) {
             const wm_word *word = &L->w[wi];
             float sx, sy;
             w2s(c, (float)word->x, (float)word->y, &sx, &sy);
             if (sx < -margin || sx > WR_W + margin) continue;
-            // A glyph reaches at most a font box either side of the centre.
-            if (sy < y0 - wr_font_size || sy > y0 + h + wr_font_size) continue;
 
-            uint32_t len;
-            const char *txt = wm_str(&a->tok_text, word->tok, &len);
+            float tin = smoothstep_e(WR_H * WR_FADE_IN_BOT, WR_H * WR_FADE_IN_TOP, sy);
+            float tout = smoothstep_e(WR_H * WR_FADE_OUT_TOP, WR_H * WR_FADE_OUT_BOT, sy);
+            float ddx = sx - WR_W * 0.5f, ddy = sy - WR_H * 0.5f;
+            float near = smoothstep_e(WR_FADE_RIM, WR_FADE_CORE,
+                                      sqrtf(ddx * ddx + ddy * ddy) / (WR_W * 0.5f));
+            float depth = near * tin * tout;
+            if (depth <= 0.004f) continue;
 
-            // Edible words read bright; inedible set-dressing (speaker names,
-            // stage cues) recedes, the way it does on the site.
             uint32_t color, alpha;
+            bool lit = false;
             if (word->eaten) {
                 color = WR_GHOST;
-                alpha = 90;  // still there, but spent
+                alpha = 110;  // still there, but spent
             } else if (L->edible) {
                 color = WR_WORD;
                 alpha = 255;
+                lit = true;
             } else {
                 color = WR_WORD_INERT;
-                alpha = 120;
+                alpha = 130;
             }
-            draw_text(c, y0, h, txt, (int)len, sx, sy, color, alpha);
+
+            uint32_t len;
+            const char *txt = wm_str(&a->tok_text, word->tok, &len);
+            wr_wordv *v = &wv[wv_n++];
+            v->txt = txt;
+            v->len = (uint16_t)len;
+            v->sx = sx;
+            v->sy = sy;
+            v->scale = (WR_SCALE_MIN + (1.0f - WR_SCALE_MIN) * tin) *
+                       (WR_SCALE_OUT + (1.0f - WR_SCALE_OUT) * tout);
+            v->rgb = color;
+            v->alpha = (uint16_t)(alpha * depth);
+            v->lit = lit;
         }
+    }
+}
+
+// Each live word puts a soft white bloom into the coarse background field. It
+// costs a couple of hundred cell writes for the whole screen because a cloud has
+// no detail worth resolving finer, and it comes out of the same resample as the
+// sphere — so the words sit in weather rather than on top of black, and a black
+// shadow has something to land on.
+static void splat_haze(wr_ctx *c) {
+    if (c->haze <= 0.01f) return;
+    const float cell = (float)WR_W / (float)WR_BG_N;
+    const float inv_cell = 1.0f / cell;
+
+    for (int k = 0; k < wv_n; k++) {
+        const wr_wordv *v = &wv[k];
+        if (!v->lit || v->alpha < 6) continue;
+        // An ellipse rather than a box: two 1-D profiles multiplied leave
+        // corners, and a cloud with corners is a card.
+        float rx = text_width_t(v->txt, v->len, 0.0f) * v->scale * 0.5f + 44.0f;
+        float ry = (float)wr_font_size * v->scale * 0.62f + 34.0f;
+        float inv_rx2 = 1.0f / (rx * rx), inv_ry2 = 1.0f / (ry * ry);
+        // The cloud outlives the word slightly — ^0.7 rather than linear. Black
+        // type has to keep something to be black against the whole way in and
+        // the whole way out, and a cloud alone at the very end of that reads as
+        // a word that has not arrived yet rather than as an error.
+        float a01 = (float)v->alpha * (1.0f / 255.0f);
+        float peak = WR_HAZE_MAX * c->haze * powf(a01, 0.7f);
+
+        int i0 = (int)((v->sx - rx) * inv_cell);
+        int i1 = (int)((v->sx + rx) * inv_cell) + 1;
+        int j0 = (int)((v->sy - ry) * inv_cell);
+        int j1 = (int)((v->sy + ry) * inv_cell) + 1;
+        if (i0 < 0) i0 = 0;
+        if (j0 < 0) j0 = 0;
+        if (i1 > WR_BG_N - 1) i1 = WR_BG_N - 1;
+        if (j1 > WR_BG_N - 1) j1 = WR_BG_N - 1;
+
+        for (int j = j0; j <= j1; j++) {
+            float dy = ((float)j + 0.5f) * cell - v->sy;
+            float qy = dy * dy * inv_ry2;
+            if (qy >= 1.0f) continue;
+            for (int i = i0; i <= i1; i++) {
+                float dx = ((float)i + 0.5f) * cell - v->sx;
+                float q = qy + dx * dx * inv_rx2;
+                if (q >= 1.0f) continue;
+                // Flat over the word, falling only outside it. A peaked
+                // profile leaves the ends of a long word on a dimmer cloud than
+                // its middle, which black type shows immediately.
+                float f = (1.0f - q) * WR_HAZE_CORE;
+                if (f > 1.0f) f = 1.0f;
+                f = f * f * (3.0f - 2.0f * f);
+
+                size_t o = (size_t)j * WR_BG_N + i;
+                uint32_t add = (uint32_t)(peak * f * bg_rim_at(i, j));
+                if (!add) continue;
+                uint8_t *px = &bg_field[o * 3];
+                for (int ch = 0; ch < 3; ch++) {
+                    uint32_t t = px[ch] + (add * ((WR_HAZE >> (16 - 8 * ch)) & 0xFF) >> 8);
+                    px[ch] = (uint8_t)(t > 255 ? 255 : t);
+                }
+            }
+        }
+    }
+}
+
+static void band_words(wr_ctx *c, int y0, int h) {
+    const float reach = (float)wr_font_size + 6.0f;
+    for (int k = 0; k < wv_n; k++) {
+        const wr_wordv *v = &wv[k];
+        if (v->sy < y0 - reach || v->sy > y0 + h + reach) continue;
+        if (v->lit)
+            draw_glyphs(c, y0, h, v->txt, v->len, v->sx + WR_SHADOW_DX,
+                        v->sy + WR_SHADOW_DY, WR_WORD_CAST,
+                        (uint32_t)(v->alpha * WR_SHADOW_A), 0.0f, v->scale, true);
+        draw_glyphs(c, y0, h, v->txt, v->len, v->sx, v->sy, v->rgb, v->alpha,
+                    0.0f, v->scale, true);
     }
 }
 
@@ -408,6 +1021,68 @@ static void cover_segment(wr_ctx *c, int y0, int h, float ax, float ay,
             float d2 = ex * ex + ey * ey;
             if (d2 >= r_out2) continue;
             uint8_t v = (d2 <= r_in2) ? 255 : (uint8_t)((r_out - sqrtf(d2)) * 255.0f);
+            if (v > crow[px]) {
+                crow[px] = v;
+                srow[px] = seg;
+            }
+        }
+    }
+}
+
+// The fringe. Coverage carries on past the silhouette, falling to zero over
+// WR_HALO px, and the stipple screen turns that ramp into dots that shrink with
+// distance — which is where "the animal is the dot field thickening" actually
+// happens. Without it the body is a stippled shape with a hard edge rather than
+// something surfacing.
+//
+// Stamped as a disc every WR_HALO_STRIDE-th segment rather than as a capsule at
+// every one. A halo is smooth by definition, and a 9 px annulus around a 5 px
+// segment is almost entirely bounding box: at full density it cost more than the
+// animal did. Discs of radius rad+9 every 20 px leave the envelope scalloped by
+// about two pixels, which nothing rendered as dots can show.
+//
+// The falloff is quadratic in distance rather than linear because linear needs a
+// square root, and the halo is the one part of the body that cannot use the
+// saturation shortcut for its own pixels.
+#define WR_HALO 9.0f
+#define WR_HALO_TOP 254.0f
+#define WR_HALO_STRIDE 4
+
+static void cover_halo(wr_ctx *c, int y0, int h, float cx, float cy, float rad,
+                       uint8_t seg) {
+    if (rad < 0.35f) return;
+    float ext = rad + WR_HALO;
+    int miny = (int)floorf(cy - ext) - y0, maxy = (int)ceilf(cy + ext) - y0;
+    if (maxy < 0 || miny >= h) return;
+    if (miny < 0) miny = 0;
+    if (maxy >= h) maxy = h - 1;
+
+    float r_in2 = rad > 0.5f ? (rad - 0.5f) * (rad - 0.5f) : 0.0f;
+    float r_halo2 = ext * ext;
+    float halo_k = WR_HALO_TOP / (r_halo2 - r_in2);
+
+    for (int py = miny; py <= maxy; py++) {
+        float fy = (float)(py + y0) + 0.5f - cy;
+        float q = r_halo2 - fy * fy;
+        if (q <= 0.0f) continue;
+        // The exact span, per row. A bounding box round a disc this fat is
+        // three-quarters corner, and the corners are the pixels that cannot be
+        // skipped cheaply.
+        float hx = sqrtf(q);
+        int minx = (int)(cx - hx), maxx = (int)(cx + hx);
+        if (maxx < 0 || minx >= WR_W) continue;
+        if (minx < 0) minx = 0;
+        if (maxx >= WR_W) maxx = WR_W - 1;
+
+        uint8_t *crow = c->cov + (size_t)py * WR_W;
+        uint8_t *srow = c->seg + (size_t)py * WR_W;
+        float fy2 = fy * fy;
+        for (int px = minx; px <= maxx; px++) {
+            if (crow[px] == 255) continue;  // the body proper, already drawn
+            float ex = (float)px + 0.5f - cx;
+            float d2 = ex * ex + fy2;
+            uint8_t v = d2 <= r_in2 ? (uint8_t)WR_HALO_TOP
+                                    : (uint8_t)((r_halo2 - d2) * halo_k);
             if (v > crow[px]) {
                 crow[px] = v;
                 srow[px] = seg;
@@ -504,6 +1179,62 @@ static void band_xray(wr_ctx *c, const wm_world *w, int y0, int h,
     }
 }
 
+// What is actually inside a nematode, at the only two scales this magnification
+// can show: the pharynx and the gut.
+//
+// C. elegans is transparent. Under a microscope you do not see a green tube —
+// you see the cuticle's outline and, straight through it, the muscular pharynx
+// pumping at the front and the intestine running the rest of the length. Those
+// two are most of what makes a photograph of one recognisable.
+//
+// The pharynx is the anterior sixth: an elongated corpus, a narrow isthmus, and
+// a round terminal bulb. That silhouette — fat, thin, round — is the single most
+// identifiable thing about the animal, and it costs about thirty discs along a
+// midline that has already been projected for the body.
+//
+// Drawn after the body, so it reads as structure seen through the cuticle rather
+// than as paint on top of it.
+
+// s -> (radius as a fraction of the local body radius, colour, alpha).
+// Segment indices, out of WM_N_SEGMENTS.
+#define WR_PHARYNX_END 31
+#define WR_GUT_START 38
+#define WR_GUT_END 186
+
+static void band_anatomy(wr_ctx *c, int y0, int h, const float *px, const float *py,
+                         const float *rad) {
+    // The gut: a darker cord at about a third of the body's width, from behind
+    // the pharynx most of the way to the tail. Every segment, not every third —
+    // segments project to 4.7 px apart and the cord is ~6 px across, so at a
+    // stride of three it came out as a string of beads instead of an organ.
+    for (int i = WR_GUT_START; i < WR_GUT_END && i < WM_N_SEGMENTS; i++) {
+        float r = rad[i] * 0.32f;
+        if (r < 0.6f) continue;
+        // Fades out toward the tail, where the real intestine narrows and the
+        // body is mostly gonad.
+        float t = (float)(i - WR_GUT_START) / (float)(WR_GUT_END - WR_GUT_START);
+        uint32_t a = (uint32_t)(165.0f * (1.0f - 0.55f * t));
+        dot(c, y0, h, px[i], py[i], r, WR_GUT, a);
+    }
+
+    // The pharynx. Corpus, isthmus, terminal bulb — fat, thin, round.
+    for (int i = 2; i <= WR_PHARYNX_END && i < WM_N_SEGMENTS; i++) {
+        float t = (float)(i - 2) / (float)(WR_PHARYNX_END - 2);  // 0 at the mouth
+        float w;
+        if (t < 0.42f) {
+            w = 0.60f - 0.10f * (t / 0.42f);        // corpus, tapering slightly
+        } else if (t < 0.62f) {
+            w = 0.24f;                               // isthmus
+        } else {
+            float u = (t - 0.62f) / 0.38f;           // terminal bulb
+            w = 0.30f + 0.36f * sinf(u * (float)M_PI);
+        }
+        float r = rad[i] * w;
+        if (r < 0.6f) continue;
+        dot(c, y0, h, px[i], py[i], r, WR_PHARYNX, 150);
+    }
+}
+
 static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py,
                       const float *rad) {
     memset(c->cov, 0, (size_t)WR_W * h);
@@ -516,6 +1247,14 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
     for (int i = 0; i < n - 1; i++)
         cover_segment(c, y0, h, px[i], py[i], px[i + 1], py[i + 1], rad[i],
                       (uint8_t)((float)i / (float)(n - 1) * 255.0f));
+
+    // Then the fringe, over the body the core pass just saturated — so its own
+    // interior pixels cost one compare each.
+    if (c->stipple > 0.5f) {
+        for (int i = 0; i < n - 1; i += WR_HALO_STRIDE)
+            cover_halo(c, y0, h, px[i], py[i], rad[i],
+                       (uint8_t)((float)i / (float)(n - 1) * 255.0f));
+    }
 
     // Composite with a head-to-tail gradient. The anterior is paler and cooler
     // (the pharynx catching light), deepening to the body green behind it,
@@ -531,10 +1270,15 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
         // was the "rainbow": per-capsule quantisation of a too-fast gradient,
         // not an intentional pattern.
         //
-        // Now the pale anterior eases out over the first quarter, and the
-        // banding is put back deliberately as a slow brightness wave along the
-        // body — 13 bands, +-14%. C. elegans really is segmented by its
-        // body-wall muscles, so it reads as anatomy rather than as an artefact.
+        // The pale anterior eases out over the first quarter, and that is all
+        // the variation there is. A slow brightness wave along the body used to
+        // sit on top of it — 13 bands at +-14%, meant to read as the body-wall
+        // muscles. Measured, it moved the hue by only 7 degrees, so it was never
+        // the "rainbow" it was accused of being; what it actually did was put a
+        // second light-and-dark texture on a body that already had one in the
+        // stipple, and between them the shape stopped being readable. The real
+        // internal structure is drawn as structure now — see band_anatomy — and
+        // WR_BODY_BANDS is left at zero rather than deleted.
         uint32_t f = fm & 0xFFFFu;
         uint32_t head_c = lerp_rgb(WR_HEAD, WR_FIRE, f);
         uint32_t body_c = lerp_rgb(WR_ACCENT, WR_FIRE, f);
@@ -548,7 +1292,8 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
             if (head_mix < 0.0f) head_mix = 0.0f;
             head_mix *= head_mix;  // ease, so the transition has no visible edge
             uint32_t base = lerp_rgb(body_c, head_c, (uint32_t)(head_mix * 255.0f));
-            float band = 0.86f + 0.14f * sinf(t * 13.0f * 2.0f * (float)M_PI);
+            float band = 1.0f - WR_BODY_BANDS +
+                         WR_BODY_BANDS * sinf(t * 13.0f * 2.0f * (float)M_PI);
             uint32_t r = (uint32_t)(((base >> 16) & 0xFF) * band);
             uint32_t g = (uint32_t)(((base >> 8) & 0xFF) * band);
             uint32_t b = (uint32_t)((base & 0xFF) * band);
@@ -558,16 +1303,46 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
         body_lut_key = fm;
     }
 
+    // Composite through the stipple screen. A pixel lights when the body's
+    // coverage there beats its threshold, so a dot's area tracks coverage and
+    // the animal resolves out of the lattice as it arrives underneath. The gain
+    // is held under full scale on purpose: at 255 the dots would flood together
+    // into the old solid body and there would be nothing to see through.
+    const int T = WR_STIPPLE_TILE;
+    const bool stip = c->stipple > 0.5f;
     for (int y = 0; y < h; y++) {
         uint8_t *crow = c->cov + (size_t)y * WR_W;
         uint8_t *srow = c->seg + (size_t)y * WR_W;
         uint16_t *drow = c->band + (size_t)y * WR_W;
+        const uint8_t *trow = stipple + (size_t)((y + y0) & (T - 1)) * T;
         for (int x = 0; x < WR_W; x++) {
-            if (!crow[x]) continue;
+            uint32_t cv = crow[x];
+            if (!cv) continue;
+            uint32_t a;
+            if (stip) {
+                // The animal's own ground, laid down before its dots. Skipped
+                // out in the thin part of the fringe, where there is nothing to
+                // separate from anyway and the pixels are many.
+                if (cv > 56) {
+                    uint32_t vk = stip_veil[cv], d = drow[x];
+                    drow[x] = (uint16_t)((((d & 0xF81Fu) * vk >> 5) & 0xF81Fu) |
+                                         (((d & 0x07E0u) * vk >> 5) & 0x07E0u));
+                }
+                uint32_t thr = trow[x & (T - 1)];
+                uint32_t v = (cv * WR_STIPPLE_GAIN) >> 8;
+                if (v <= thr) continue;
+                a = (v - thr) * WR_STIPPLE_EDGE;
+                if (a > 255) a = 255;
+                // Out in the halo the dots are not only smaller but fainter, so
+                // the field thins into the background instead of ending.
+                a = (a * stip_gain[cv]) >> 8;
+                if (!a) continue;
+            } else {
+                a = cv;  // no halo pass ran, so this is plain edge coverage
+            }
             uint32_t m = srow[x];  // position along the body, 0 head .. 255 tail
-            uint32_t a = crow[x];
             if (a >= 255) {
-                drow[x] = body_lut[m];  // the interior, which is most of it
+                drow[x] = body_lut[m];
             } else {
                 uint32_t src = body_lut[m], d = drow[x], ia = 255 - a;
                 drow[x] = (uint16_t)(
@@ -591,7 +1366,9 @@ static void band_worm(wr_ctx *c, int y0, int h, const float *px, const float *py
             if (lit <= 0.0f) continue;
             uint32_t a = (uint32_t)(lit * c->flash * 230.0f);
             if (a > 255) a = 255;
-            dot(c, y0, h, px[i], py[i], rad[i] * 0.52f + 1.2f, WR_FIRE, a);
+            // Smaller than they were: against a solid body a node this size
+            // read as a node, against the stipple it read as a hole.
+            dot(c, y0, h, px[i], py[i], rad[i] * 0.34f + 1.0f, WR_FIRE, a);
         }
     }
 }
@@ -619,8 +1396,36 @@ static void band_mask(wr_ctx *c, int y0, int h) {
 
 void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user) {
     c->frame++;
-    c->cam_x = (float)w->body.target_x;
-    c->cam_y = (float)w->body.target_y;
+
+    float tgx = (float)w->body.target_x, tgy = (float)w->body.target_y;
+    float dt = c->bg_time - c->cam_t;
+    if (!c->cam_have || dt < 0.0f || dt > 1.0f) {
+        c->cam_sx = tgx;
+        c->cam_sy = tgy;
+        c->cam_have = true;
+        dt = 0.0f;
+    }
+    // dt of zero means the caller is not advancing bg_time; weld to the head
+    // rather than stall the camera entirely.
+    float k = (dt > 0.0f && c->cam_lag > 0.001f) ? 1.0f - expf(-dt / c->cam_lag) : 1.0f;
+    c->cam_sx += (tgx - c->cam_sx) * k;
+    c->cam_sy += (tgy - c->cam_sy) * k;
+    // Leash. A long lag is what actually smooths the bob out — but on its own it
+    // lets the head wander out of frame, because a good part of the head's
+    // motion is the animal genuinely travelling and the camera has to go too.
+    // So: follow slowly, and drag the rest of the way once the head is more than
+    // WR_CAM_LEASH px off the middle. Smooth where it can be, hard where it must.
+    float ox = tgx - c->cam_sx, oy = tgy - c->cam_sy;
+    float lim = WR_CAM_LEASH / scale_of(c);
+    float od2 = ox * ox + oy * oy;
+    if (od2 > lim * lim) {
+        float f = 1.0f - lim / sqrtf(od2);
+        c->cam_sx += ox * f;
+        c->cam_sy += oy * f;
+    }
+    c->cam_t = c->bg_time;
+    c->cam_x = c->cam_sx;
+    c->cam_y = c->cam_sy;
     if (c->shudder > 0.001f) {
         // Two incommensurate frequencies so it reads as a jitter rather than a
         // wobble. Camera only — the body itself is the simulation's business.
@@ -672,7 +1477,24 @@ void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user) {
         n_vis++;
     }
 
-    const uint16_t stage = to565(WR_STAGE);
+    // The background: the ball first (it moves slowly enough to be worth every
+    // other frame), then this frame's haze on top of a copy of it.
+    uint32_t tb0 = WR_T();
+    if (c->bg_alien) {
+        if (bg_noise_frame == 0xFFFFFFFFu ||
+            c->frame - bg_noise_frame >= WR_BG_NOISE_EVERY) {
+            build_bg_noise(c->bg_time);
+            bg_noise_frame = c->frame;
+        }
+        memcpy(bg_field, bg_noise, WR_BG_BYTES);
+    } else {
+        memset(bg_field, 0, WR_BG_BYTES);
+    }
+    build_words(c, w);
+    splat_haze(c);
+    bg_row_have = -1;
+    wr_us_sphere += WR_T() - tb0;
+
     float ring_r = (1.0f - c->flash) * 210.0f + 14.0f;
     uint32_t ring_a = (uint32_t)(c->flash * c->flash * 150.0f);
 
@@ -683,22 +1505,28 @@ void wr_draw_banded(wr_ctx *c, const wm_world *w, wr_blit_fn blit, void *user) {
         c->band = c->band_mem + (size_t)c->band_parity * WR_W * c->band_rows;
         c->band_parity ^= 1;
 
-        for (size_t i = 0; i < n; i++) c->band[i] = stage;
+        uint32_t tg0 = WR_T();
+        band_bg(c, y0, h);
+        wr_us_bg += WR_T() - tg0;
 
         uint32_t t0 = WR_T();
-        for (int k = 0; k < n_vis; k++) {
-            if (vis_y1[k] < y0 || vis_y0[k] >= y0 + h) continue;
-            int i = vis[k];
-            frame_line(c, y0, h, fx[i - 1], fy[i - 1], fx[i], fy[i],
-                       WR_FRAME_HALF_WIDTH, wr_frame[i].alpha);
+        uint32_t ga = (uint32_t)(c->globe_alpha * 256.0f);
+        if (ga) {
+            for (int k = 0; k < n_vis; k++) {
+                if (vis_y1[k] < y0 || vis_y0[k] >= y0 + h) continue;
+                int i = vis[k];
+                frame_line(c, y0, h, fx[i - 1], fy[i - 1], fx[i], fy[i],
+                           WR_FRAME_HALF_WIDTH, wr_frame[i].alpha * ga >> 8);
+            }
         }
 
         uint32_t t1 = WR_T();
-        band_words(c, w, y0, h);
+        band_words(c, y0, h);
         uint32_t t2 = WR_T();
         band_worm(c, y0, h, px, py, rad);
         uint32_t t3 = WR_T();
         wr_us_frame += t1 - t0; wr_us_words += t2 - t1; wr_us_worm += t3 - t2;
+        if (c->anatomy && !c->xray) band_anatomy(c, y0, h, px, py, rad);
         if (c->xray) band_xray(c, w, y0, h, px, py, rad);
         if (ring_a > 4) pulse_ring(c, y0, h, ring_r, ring_a);
 

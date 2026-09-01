@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Rasterise a TTF into an 8-bit alpha atlas plus a C table.
 
-Baskerville by default — an 18th-century English typeface, which is about as
-close to Hamlet's printing tradition as the system font list gets.
+Georgia at 42 px is what the board ships. Baskerville was tried first — an
+18th-century English typeface, about as close to Hamlet's printing tradition as
+the system font list gets — and dissolved at this pixel density; Georgia was
+drawn for screen legibility and holds.
+
+The defaults here are the shipped ones, so running this with no arguments
+reproduces the committed font_data.c.
 
 The output is plain C data so the exact same glyph blitter runs in the host
 preview and on the ESP32, with no font engine on either side. ~30 KB of flash.
@@ -12,7 +17,7 @@ The tokeniser in corpus/hamlet.py is `[A-Za-z']+|[.,!?;:—\\-]`, so the em dash
 after '~' rather than a real codepoint map, since it is the only non-ASCII
 character the corpus can produce.
 
-    python3 tools/mkfont.py --size 17
+    python3 tools/mkfont.py --size 42
 """
 from __future__ import annotations
 
@@ -30,9 +35,9 @@ CHARS = [chr(c) for c in range(FIRST, LAST + 1)] + [EM_DASH]
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--font", default="/System/Library/Fonts/Supplemental/Baskerville.ttc")
+    ap.add_argument("--font", default="/System/Library/Fonts/Supplemental/Georgia.ttf")
     ap.add_argument("--index", type=int, default=0)
-    ap.add_argument("--size", type=int, default=17)
+    ap.add_argument("--size", type=int, default=42)
     ap.add_argument("--out", type=Path,
                     default=REPO / "firmware" / "components" / "wormrender" / "font_data.c")
     args = ap.parse_args()

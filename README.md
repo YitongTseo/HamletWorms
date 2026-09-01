@@ -23,29 +23,123 @@ is four small matmuls.
 |---|---|
 | worm asset — brain, corpus, taste | 1.02 MB |
 | voice bank — all 4919 words | 10.47 MB |
-| app | 0.36 MB |
-| **total** | **11.85 MB of 16 MB** |
+| app | 1.12 MB |
+| **total** | **12.61 MB of 16 MB** |
+
+The app was 0.36 MB before the genome sync went in; most of what it gained since
+is the WiFi stack. 31 KB of it is the type going from 34 px to 42 — the glyph
+atlas is uncompressed 8-bit alpha, so its cost is quadratic in the point size.
 
 ## Look
 
-Black ground, white words, green animal.
+Black ground, black words in white clouds, green animal, and one dark thing
+turning behind all three.
 
-True black is doing real work here: on an AMOLED those pixels are simply off, so
-the ground reads as depth rather than as a dark grey panel.
+True black is still doing real work: on an AMOLED those pixels are simply off,
+so the ground reads as depth rather than as a dark grey panel. Everything added
+since is kept dim enough not to spend that — which is also why the words went
+from white to black. White type on a white haze is the worst of both; the haze
+had to be either dark enough to leave the type alone, which is no haze at all,
+or bright enough to be ink on paper. It is ink on paper.
 
 **The visible circle is the worm's chemosensory horizon.** `FOOD_SENSE_RADIUS` is
 200 world units, so a 400-unit window on a 466 px round display puts the rim
 exactly on the edge of what the worm can smell. Words drift in from outside its
 awareness and become real as they cross.
 
-**Type is Georgia at 26 px.** Georgia was drawn for screen legibility at small
-sizes; Baskerville, tried first, dissolved at this pixel density.
+**Type is Georgia at 42 px.** Georgia was drawn for screen legibility; Baskerville,
+tried first, dissolved at this pixel density. 42 overlaps neighbouring words in a
+crowded line, and that is the trade taken — a word you can read from across the
+room is worth more than a line that never collides.
 
-**Behind everything, a wireframe globe** — parallels and meridians of a sphere
-under orthographic projection, tilted 23.5° so neither family collapses to a
-line, with alpha falling off by depth so the far side sits behind the near side.
-It is screen-fixed, not world-fixed: the camera rides the worm's head, so a
-static graticule reads as the instrument you are looking through.
+**The camera lags the head by 2.5 seconds, on a 105 px leash.** It used to sit
+exactly on it, and that turned out to be why nothing else in this section
+worked. The head bobs at a mean 44 px/s and peaks at 127; words drift up at
+17.5. So a word's motion on screen was mostly head-twitch — it crossed a fade
+band in a fraction of a second and then crossed straight back, and no width of
+band could have fixed it. Low-passing the camera takes that to a mean 23 px/s.
+
+Lag alone is not enough, because a good part of the head's motion is the animal
+genuinely travelling and the camera has to go too: at 4 s of lag the head
+wanders 256 px off centre and leaves the frame. So the filter is long and the
+offset is clamped — follow slowly, drag the rest of the way past 105 px. Smooth
+where it can be, hard where it must be. The animal now weaves inside the frame
+instead of being pinned to the middle of it, which is also what makes the fixed
+dot lattice read as something it is passing under.
+
+**Words arrive rather than appear.** A word's weight is its distance from the
+middle of the panel: full inside 60% of the radius, nothing at the bezel. That
+is 103 px of travel, about four seconds, and it is the part that does the work —
+the panel is a circle, so a word off to one side crosses the bezel on an arc
+rather than through the bottom, and a purely vertical profile let it switch on
+the moment it cleared the mask. It is also the peripheral-vision reading the
+framing already claims: what is off to the side is hazy, what is in the middle
+is sharp.
+
+On top of that, a vertical profile: over the bottom of the panel a word grows
+from 54% size and fades up, holds through the middle, then over the top third
+fades out and draws back down, which reads as passing overhead rather than as
+being deleted.
+
+Growth has to be continuous, so a scaled word resamples the atlas bilinearly
+rather than picking a smaller baked size: stepping between two baked sizes moves
+a word's edges several pixels at once, which is visible as a twitch even under a
+fade. Full size takes the straight blit, and that is where words spend most of
+their life.
+
+**Each live word is black, sitting in a cloud, casting a shadow onto it.** The
+cloud comes first: it is the only reason black type is legible on a black panel
+at all, and the only reason a shadow has anywhere to land. So it is flat-topped
+rather than peaked — a profile that falls off from the centre leaves the ends of
+a long word on a dimmer ground than its middle, which black type shows
+immediately — and it outlives the word slightly, fading as `alpha^0.7`, so there
+is always something to be black against at both ends of the word's life.
+
+The shadow is violet-grey, not black. The word itself is nearly black now, so a
+black shadow under it is just a heavier letter; what should read is the sliver
+that falls past the stroke onto the cloud.
+
+Set-dressing (speaker names, stage cues) and already-eaten words get no cloud,
+so they stay light — pale blue and spent green. Only the food is ink.
+
+**Behind everything, an alien sphere.** Three-dimensional value noise on the
+surface of an orthographic ball, ridged so the level sets are crests rather than
+plateaux, with the noise's own domain warped by a coarser octave of itself — so
+the pattern is dragged through itself as the ball turns and the thing folds
+inward instead of merely drifting. A fixed key light and a cold fresnel at the
+limb make it read as a solid rather than as a disc of texture. It is violet, not
+green: the animal is the only green thing on the panel and has to stay that way.
+
+The world-anchored wireframe globe is still there at about a fifth of its old
+weight. It is the only thing on the panel that says where in the play the worm
+currently is — its poles sit on `SPAWN_Y` and `KILL_Y` — but it is no longer the
+background, and `wr_ctx.globe_alpha` will take it to zero.
+
+**The animal is made of dots.** A clustered-dot threshold screen, tiled and
+fixed to the panel: a pixel lights when the body's coverage there exceeds its
+threshold, and the threshold rises as the square of the distance to the nearest
+dot centre, so a dot's area is linear in coverage. The lattice does not move, so
+the worm reads as something passing under a fabric rather than as something
+wearing a texture. The gain is held under full scale on purpose — at 255 the
+dots flood together into the old solid body and there is nothing to see through.
+
+Coverage runs past the silhouette and falls to zero over 9 px, so the dots shrink
+outward into a fringe, and the same screen at its lowest threshold puts a sparse
+dot of dust across the whole panel. That is the reading: a field of dots, and the
+animal is where they thicken.
+
+**The animal darkens what it crosses.** Its own coverage pushes the ground under
+it down by up to 72% before any of its dots are laid on top. Without that, green
+dots landing on a white word-cloud sit at nearly the same value as the black
+type beside them and the two read as one texture; with it the worm always has a
+dark ground of its own and is unmistakably in front. The words stay legible
+through it, which is the point — it is a shadow, not an eraser.
+
+The rainbow is gone. It was never a pattern — it was per-capsule quantisation of
+a gradient that ran head colour into body colour over the front 18% of the
+animal, steep enough that each capsule landed on a visibly different shade. One
+hue now, with the banding put back deliberately as a slow brightness wave: 13
+bands at ±14%, which is roughly what the body-wall muscles actually do.
 
 **Eating fires the neurons.** Nodes every eighth segment light in a wave that
 travels head to tail, a pulse ring leaves the head, and the body lifts slightly
@@ -54,6 +148,22 @@ toward white — slightly, so the animal still reads as green while it happens.
 The body is 800 world units long against a 400-unit window, so the tail trails
 out of frame. Deliberate: the head is where the eating happens, and a microscope
 does not show you the whole animal.
+
+### Everything low-frequency happens on a 64x64 grid
+
+The ball and the clouds behind the words are both genuinely low-frequency —
+nothing in either has detail finer than seven pixels. So neither is evaluated per
+pixel. They share one 64x64 RGB field: the ball is written into it (every third
+frame — it turns at 0.11 rad/s, and there is nothing in it that moves far enough
+in three frames to see), each live word adds an elliptical bloom to a copy, and
+the whole thing is bilinearly resampled on the way to the panel.
+
+That is 4096 samples and a resample instead of 217156 shader evaluations, and it
+is the only reason any of this fits in the frame budget. The resample itself is
+the most expensive per-pixel loop in the renderer, so it does the horizontal
+half once per source row into RGB565 and leaves one packed blend per pixel; it
+skips the fifth of every band that lies outside the round panel; and the dust
+comes from a precomputed list of positions rather than a per-pixel test.
 
 ## Voice
 
@@ -119,11 +229,55 @@ On the board:
 
 ## Performance
 
-Measured on the board: **12–20 fps**, with the simulation holding **60.00 Hz**
-exactly (36,001 ticks in 600 s). The tick rate is the number that matters — it
-is the rate the server-side twin runs at too.
+Measured on the board: **6.3–7.6 fps**, with the simulation holding **60 Hz**
+exactly (3633 ticks in 60.7 s). The tick rate is the number that matters — it is
+the rate the server-side twin runs at too, and none of what follows touches it.
 
-Four findings, none of which the host preview could have produced:
+The look before the sphere, the clouds and the stipple ran at **11.3–13.7 fps**
+on the same board. The new renderer costs **1.9×** the draw time, 52–64 ms
+becoming 104–124 ms:
+
+| stage | ms |
+|---|---|
+| the ball, plus the frame's word list and its haze | 11–13 |
+| resampling the background onto the panel | 21 |
+| graticule | 6–10 |
+| words | 7–14 |
+| stippled body, incl. the ground it lays down | 50–65 |
+
+The host preview predicted 1.7× and was right, which is worth recording because
+the findings below are all cases of it being wrong. What it got wrong here is
+the *shape*: the background resample is 210× slower on the S3 than on the host,
+where the stippled body is only 114× slower. A tight integer loop over 172,000
+pixels is what this chip is worst at relative to a desktop, and it is the thing
+to attack next.
+
+Getting even to 1.8× took three cuts. Two of them show up as host stage totals:
+
+| | before | after |
+|---|---|---|
+| background resample | 0.48 ms | 0.10 ms |
+| stippled body incl. fringe | 0.80 ms | 0.44 ms |
+
+The background field first interpolated in 8-bit RGB and packed to 565 per
+pixel. Doing the horizontal half once per source row and storing *that* in 565
+leaves one packed blend per output pixel — and it costs no fidelity, because the
+panel is 565 either way, so both paths land on the same colours.
+
+The fringe outside the body was a 9 px annulus rasterised around all 200 body
+capsules. A 9 px annulus around a 5 px segment is almost entirely bounding box:
+it cost more than the animal did. It is now a disc stamped every fourth segment,
+walked by exact per-row spans rather than a box, which leaves the envelope
+scalloped by about two pixels — nothing rendered as dots can show that.
+
+And the ball is rebuilt every third frame rather than every frame.
+
+Everything added is behind a runtime switch, so a board that turns out not to
+afford it can give any of it back: `wr_ctx.bg_alien`, `haze`, `stipple`,
+`globe_alpha`. Turning the ball off is worth about 32 ms a frame on its own,
+which is most of the way back to the old frame rate.
+
+Five findings, none of which the host preview could have produced:
 
 - The renderer ran in float64 like the sim and took **2.7 s a frame**. The S3's
   FPU is single-precision only, so ~400k `sqrt`/`hypot` calls a frame were
@@ -146,6 +300,19 @@ Four findings, none of which the host preview could have produced:
   waits on with `portMAX_DELAY`. Two alternating band buffers, an
   `on_color_trans_done` semaphore, and a *bounded* wait fix it: a lost
   completion costs one frame, not the animal.
+
+- **24 KB of internal DRAM was the difference between an animal and a
+  slideshow.** The renderer's background field was allocated
+  `MALLOC_CAP_INTERNAL` first, like everything else here. It fit — and then
+  `xTaskCreatePinnedToCore` for the worm task could not find 8 KB for its stack,
+  returned `pdFAIL`, and nothing checked it. The board booted, logged a clean
+  startup, printed a heartbeat every second and sat on a frozen tick count
+  forever: the 3 KB heartbeat had fit where the 8 KB worm did not. The field is
+  PSRAM now, which is where it belonged — it is written 4096 cells every third
+  frame and read back a 192-byte row at a time, nothing like the scattered
+  single-byte writes that made PSRAM unusable for the band scratch. Both
+  `xTaskCreate` calls are checked now, and the free internal heap is logged just
+  before them.
 
 That last one presented as a dead serial console. What separated "the app hung"
 from "the console stopped" was a heartbeat task pinned to the other core: it

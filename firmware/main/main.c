@@ -252,6 +252,9 @@ static void worm_task(void *arg) {
         // ~0.2 s whether the renderer is managing 10 fps or 20.
         float dt = (float)(t_loop0 - last_us) / 1e6f;
         last_us = t_loop0;
+        // The ball behind everything turns on wall-clock seconds, not on frames,
+        // so it folds at the same rate whatever the renderer is managing.
+        s_ctx.bg_time += dt;
         s_ctx.flash -= s_ctx.flash * dt * 3.2f;  // ~0.3 s tail
         // Hold the identity card for a couple of seconds, then let it go.
         if (s_ctx.title_alpha > 0.0f) {
@@ -281,15 +284,17 @@ static void worm_task(void *arg) {
             int64_t t = esp_timer_get_time();
             ESP_LOGI(TAG,
                      "%.1f fps | sim %.0f  draw %.0f ms | tick %lld | "
-                     "frame %lu words %lu worm %lu ms | stack %u | pokes %lu",
+                     "ball %lu bg %lu frame %lu words %lu worm %lu ms | stack %u | pokes %lu",
                      60.0 * 1e6 / (double)(t - fps_t0),
                      us_sim / 60000.0, us_draw / 60000.0,
                      (long long)s_world->tick_count,
+                     (unsigned long)(wr_us_sphere / 60000),
+                     (unsigned long)(wr_us_bg / 60000),
                      (unsigned long)(wr_us_frame / 60000), (unsigned long)(wr_us_words / 60000),
                      (unsigned long)(wr_us_worm / 60000),
                      (unsigned)uxTaskGetStackHighWaterMark(NULL),
                      (unsigned long)s_pokes);
-            wr_us_frame = wr_us_words = wr_us_worm = 0;
+            wr_us_sphere = wr_us_bg = wr_us_frame = wr_us_words = wr_us_worm = 0;
             fps_t0 = t;
             us_sim = us_draw = us_blit = 0;
             frames = 0;
@@ -372,8 +377,21 @@ void app_main(void) {
     // The frame is world-space line work now, not a screen-space mask: this
     // just precomputes its world coordinates.
     wr_clock = us_now;
-    wr_build_globe(NULL);
-    wr_init(&s_ctx, scratch, s_band_rows, NULL);
+    // The coarse background grids. PSRAM deliberately, unlike everything else
+    // here: it is written 4096 cells every third frame and read back a 192-byte
+    // row at a time, which is ~24 KB of near-sequential traffic a frame. Nothing
+    // about that is the access pattern that made PSRAM unusable for the band
+    // scratch, and the 24 KB matters far more where it is: taking it out of
+    // internal DRAM left too little for the worm task's 8 KB stack, and the
+    // animal silently never started.
+    uint8_t *bg = heap_caps_malloc(wr_bg_bytes(), MALLOC_CAP_SPIRAM);
+    if (!bg) bg = heap_caps_malloc(wr_bg_bytes(), MALLOC_CAP_INTERNAL);
+    if (!bg) {
+        ESP_LOGE(TAG, "no room for the background field");
+        return;
+    }
+    wr_build_globe();
+    wr_init(&s_ctx, scratch, s_band_rows, bg);
 
     meta_field(s_asset.meta, "worm", s_title, sizeof(s_title));
     char gen[24];
@@ -424,6 +442,19 @@ void app_main(void) {
     sc.on_genome = on_new_genome;
     sync_start(&sc);
 
-    xTaskCreatePinnedToCore(worm_task, "worm", 8192, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(heartbeat_task, "beat", 3072, NULL, 2, NULL, 0);
+    // Check both. An unchecked xTaskCreate is the one way this app can fail
+    // that the heartbeat cannot describe: with the worm task never created, the
+    // board boots, logs a clean startup, prints a heartbeat every second and
+    // shows a frozen tick count forever. That is exactly what happened when the
+    // renderer's background field was still coming out of internal DRAM — the
+    // 3 KB heartbeat fit and the 8 KB worm did not.
+    ESP_LOGI(TAG, "internal heap %u B free, largest block %u B",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    if (xTaskCreatePinnedToCore(worm_task, "worm", 8192, NULL, 5, NULL, 1) != pdPASS) {
+        ESP_LOGE(TAG, "could not create the worm task; out of internal DRAM");
+        return;
+    }
+    if (xTaskCreatePinnedToCore(heartbeat_task, "beat", 3072, NULL, 2, NULL, 0) != pdPASS)
+        ESP_LOGW(TAG, "no heartbeat task; a hang will just go quiet");
 }
